@@ -1,0 +1,4 @@
+# HakiOS defconfig for the POCO M8 5G (parrot): the common kernel, the sm6475 family's facts, and this device's own.
+#include common_defconfig
+#include sm6475.config
+#include parrot.config

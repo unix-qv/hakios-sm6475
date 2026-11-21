@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>System</key>
+	<dict>
+		<key>Network</key>
+		<dict>
+			<key>HostNames</key>
+			<dict>
+				<key>LocalHostName</key>
+				<string>POCO-M8</string>
+			</dict>
+		</dict>
+		<key>System</key>
+		<dict>
+			<key>ComputerName</key>
+			<string>POCO M8</string>
+		</dict>
+	</dict>
+</dict>
+</plist>

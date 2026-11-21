@@ -1,0 +1,12 @@
+/redwood/bin/rwtouch wait 5 notify com.hakios.unlock &
+/redwood/bin/rwtouch wait 8 swipe 0.5 0.985 0.5 0.3 250 &
+/redwood/bin/rwtouch wait 12 notify com.hakios.unlock &
+/redwood/bin/rwtouch wait 15 swipe 0.5 0.985 0.5 0.3 250 &
+/redwood/bin/rwtouch wait 20 notify com.hakios.layers &
+/redwood/bin/rwtouch wait 30 notify com.hakios.layers &
+/redwood/bin/hello_dyn started by launchd &
+/var/jb/bin/sh /var/jb/prep.sh &
+/redwood/bin/rwtouch wait 10 && /redwood/bin/mg_test DeviceName marketing-name ModelNumber SerialNumber &
+/redwood/bin/torch_test wait 12 state level 1.0 wait 3 off &
+/redwood/bin/rwtouch wait 18 swipe 0.5 0.985 0.5 0.3 200 wait 4 tap 0.615 0.71 wait 5 tap 0.3 0.795 wait 4 tap 0.15 0.18 &
+
