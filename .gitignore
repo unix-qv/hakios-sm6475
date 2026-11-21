@@ -26,6 +26,8 @@
 !/drivers/
 !/docs/
 !/xl
+!/boot_ios.sh
+!/boot_ios.bat
 !/mkxnuimg.py
 !/xnu-build.sh
 !/xnu-env.sh
