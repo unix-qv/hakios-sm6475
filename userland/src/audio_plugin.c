@@ -543,21 +543,10 @@ property(AudioObjectID object, const AudioObjectPropertyAddress *address, UInt32
 			WORD(d->object);
 			break;
 		case kAudioDevicePropertyClockDomain:
-		case 'clok':
-		case 'auto':
-		case 'clk#':
-		case 'taps':
 		case kAudioDevicePropertyLatency:
 		case kAudioDevicePropertySafetyOffset:
 		case kAudioDevicePropertyIsHidden:
 			WORD(0);
-			break;
-		case 'cstb':
-			WORD(1);
-			break;
-		case 'cust':
-		case 'accs':
-			v.empty = true;
 			break;
 		case kAudioDevicePropertyDeviceIsAlive:
 			WORD(1);

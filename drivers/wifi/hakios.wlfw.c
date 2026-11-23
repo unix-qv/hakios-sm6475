@@ -203,6 +203,8 @@ ask(const char *what, int message, size_t largest, const struct qmi_elem_info *r
 	return false;
 }
 
+extern bool hakios_wifi_is_parrot(void);
+
 /*
  * A file to the firmware in pieces, as qmi.c's ath11k_qmi_load_file_target_mem() sends one
  * (down to "what is left" as the total, and one structure reused for every piece).
@@ -229,7 +231,7 @@ send_file(const char *what, const char *name, uint8_t type, uint32_t board_id)
 		request.file_id_valid = 1;
 		request.file_id = board_id;
 		request.total_size_valid = 1;
-		request.total_size = left;
+		request.total_size = hakios_wifi_is_parrot() ? (uint32_t)size : left;
 		request.seg_id_valid = 1;
 		request.data_valid = 1;
 		request.bdf_type = type;
@@ -311,8 +313,9 @@ mission(void)
 	struct qmi_wlanfw_wlan_ini_resp_msg_v01 ini_reply;
 	struct qmi_wlanfw_wlan_mode_req_msg_v01 mode;
 	struct qmi_wlanfw_wlan_mode_resp_msg_v01 mode_reply;
+	bool parrot = hakios_wifi_is_parrot();
 
-	if (WLFW_SENDS_INI) {
+	if (!parrot && WLFW_SENDS_INI) {
 		bzero(&ini, sizeof(ini));
 		bzero(&ini_reply, sizeof(ini_reply));
 		ini.enablefwlog_valid = 1;
@@ -322,30 +325,53 @@ mission(void)
 			return false;
 		}
 	}
-	/* ath11k_qmi_wlanfw_wlan_cfg_send(), but for the shadow registers (see the top) */
+	/* ath11k_qmi_wlanfw_wlan_cfg_send() / ath10k_qmi_cfg_send_sync_msg() */
 	bzero(&cfg, sizeof(cfg));
 	bzero(&cfg_reply, sizeof(cfg_reply));
-	cfg.host_version_valid = 1;
-	strlcpy(cfg.host_version, ATH11K_HOST_VERSION_STRING, sizeof(cfg.host_version));
-	cfg.tgt_cfg_valid = 1;
-	cfg.tgt_cfg_len = WLFW_PIPE_COUNT;
-	for (uint32_t i = 0; i < cfg.tgt_cfg_len; i++) {
-		cfg.tgt_cfg[i].pipe_num = WLFW_PIPES[i].pipenum;
-		cfg.tgt_cfg[i].pipe_dir = WLFW_PIPES[i].pipedir;
-		cfg.tgt_cfg[i].nentries = WLFW_PIPES[i].nentries;
-		cfg.tgt_cfg[i].nbytes_max = WLFW_PIPES[i].nbytes_max;
-		cfg.tgt_cfg[i].flags = WLFW_PIPES[i].flags;
+	if (parrot) {
+		cfg.host_version_valid = 0;
+		cfg.tgt_cfg_valid = 1;
+		cfg.tgt_cfg_len = (uint32_t)(sizeof(wcn3990_pipes) / sizeof(wcn3990_pipes[0]));
+		for (uint32_t i = 0; i < cfg.tgt_cfg_len; i++) {
+			cfg.tgt_cfg[i].pipe_num = wcn3990_pipes[i].pipenum;
+			cfg.tgt_cfg[i].pipe_dir = wcn3990_pipes[i].pipedir;
+			cfg.tgt_cfg[i].nentries = wcn3990_pipes[i].nentries;
+			cfg.tgt_cfg[i].nbytes_max = wcn3990_pipes[i].nbytes_max;
+			cfg.tgt_cfg[i].flags = wcn3990_pipes[i].flags;
+		}
+		cfg.svc_cfg_valid = 1;
+		cfg.svc_cfg_len = (uint32_t)(sizeof(wcn3990_services) / sizeof(wcn3990_services[0]));
+		for (uint32_t i = 0; i < cfg.svc_cfg_len; i++) {
+			cfg.svc_cfg[i].service_id = wcn3990_services[i].service_id;
+			cfg.svc_cfg[i].pipe_dir = wcn3990_services[i].pipedir;
+			cfg.svc_cfg[i].pipe_num = wcn3990_services[i].pipenum;
+		}
+		cfg.shadow_reg_valid = 1;
+		cfg.shadow_reg_len = (uint32_t)(sizeof(wcn3990_shadow_regs) / sizeof(wcn3990_shadow_regs[0]));
+		memcpy(cfg.shadow_reg, wcn3990_shadow_regs, sizeof(wcn3990_shadow_regs));
+	} else {
+		cfg.host_version_valid = 1;
+		strlcpy(cfg.host_version, ATH11K_HOST_VERSION_STRING, sizeof(cfg.host_version));
+		cfg.tgt_cfg_valid = 1;
+		cfg.tgt_cfg_len = WLFW_PIPE_COUNT;
+		for (uint32_t i = 0; i < cfg.tgt_cfg_len; i++) {
+			cfg.tgt_cfg[i].pipe_num = WLFW_PIPES[i].pipenum;
+			cfg.tgt_cfg[i].pipe_dir = WLFW_PIPES[i].pipedir;
+			cfg.tgt_cfg[i].nentries = WLFW_PIPES[i].nentries;
+			cfg.tgt_cfg[i].nbytes_max = WLFW_PIPES[i].nbytes_max;
+			cfg.tgt_cfg[i].flags = WLFW_PIPES[i].flags;
+		}
+		cfg.svc_cfg_valid = 1;
+		cfg.svc_cfg_len = WLFW_SERVICE_COUNT;
+		for (uint32_t i = 0; i < cfg.svc_cfg_len; i++) {
+			cfg.svc_cfg[i].service_id = WLFW_SERVICES[i].service_id;
+			cfg.svc_cfg[i].pipe_dir = WLFW_SERVICES[i].pipedir;
+			cfg.svc_cfg[i].pipe_num = WLFW_SERVICES[i].pipenum;
+		}
 	}
-	cfg.svc_cfg_valid = 1;
-	cfg.svc_cfg_len = WLFW_SERVICE_COUNT;
-	for (uint32_t i = 0; i < cfg.svc_cfg_len; i++) {
-		cfg.svc_cfg[i].service_id = WLFW_SERVICES[i].service_id;
-		cfg.svc_cfg[i].pipe_dir = WLFW_SERVICES[i].pipedir;
-		cfg.svc_cfg[i].pipe_num = WLFW_SERVICES[i].pipenum;
-	}
-	say("wifi: %u: the configuration: host version \"%s\", %u pipes and %u services from ath11k's tables for this chip; "
-	    "shadow registers: none%s\n", wlfw.step, cfg.host_version, cfg.tgt_cfg_len, cfg.svc_cfg_len, WLFW_SHADOW_REGISTERS ?
-	    " (ath11k SENDS A LIST of up to 36 here)" : "");
+	say("wifi: %u: the configuration: host version \"%s\", %u pipes and %u services; "
+	    "shadow registers: %u%s\n", wlfw.step, cfg.host_version, cfg.tgt_cfg_len, cfg.svc_cfg_len, cfg.shadow_reg_len,
+	    (!parrot && WLFW_SHADOW_REGISTERS) ? " (ath11k SENDS A LIST of up to 36 here)" : "");
 	if (!ask("the configuration", QMI_WLANFW_WLAN_CFG_REQ_V01, QMI_WLANFW_WLAN_CFG_REQ_MSG_V01_MAX_LEN,
 	    qmi_wlanfw_wlan_cfg_req_msg_v01_ei, &cfg, qmi_wlanfw_wlan_cfg_resp_msg_v01_ei, &cfg_reply, false)) {
 		return false;
@@ -370,14 +396,20 @@ hakios_wlfw_exchange(uint32_t step)
 	struct qmi_wlanfw_ind_register_resp_msg_v01 indications_reply;
 	struct qmi_wlanfw_host_cap_req_msg_v01 host;
 	struct qmi_wlanfw_host_cap_resp_msg_v01 host_reply;
+	struct wlfw_msa_info_req_msg_v01 msa_info;
+	struct wlfw_msa_info_resp_msg_v01 msa_info_reply;
+	struct wlfw_msa_ready_req_msg_v01 msa_ready = { 0 };
+	struct wlfw_msa_ready_resp_msg_v01 msa_ready_reply;
+	struct wlfw_cal_report_req_msg_v01 cal_report = { 0 };
+	struct wlfw_cal_report_resp_msg_v01 cal_report_reply;
 	struct qmi_wlanfw_cap_req_msg_v01 what = { 0 };
 	static struct qmi_wlanfw_cap_resp_msg_v01 target;
 	struct qmi_wlanfw_device_info_req_msg_v01 where = { 0 };
 	struct qmi_wlanfw_device_info_resp_msg_v01 device;
 	struct qmi_wlanfw_wlan_mode_req_msg_v01 mode;
 	struct qmi_wlanfw_wlan_mode_resp_msg_v01 mode_reply;
-	uint32_t calibrate = 0, seconds = 5, to_mission = 0, board_id;
-	bool far = false, board = false;
+	uint32_t calibrate = 0, seconds = 5, to_mission = 0, board_id, instance;
+	bool far = false, board = false, parrot = hakios_wifi_is_parrot();
 	int ret;
 
 	if (handle_open) {
@@ -395,25 +427,32 @@ hakios_wlfw_exchange(uint32_t step)
 		return false;
 	}
 	handle_open = true;
-	ret = qmi_add_lookup(&handle, ATH11K_QMI_WLFW_SERVICE_ID_V01, ATH11K_QMI_WLFW_SERVICE_VERS_V01,
-	    ATH11K_QMI_WLFW_SERVICE_INS_ID_V01_WCN6750);
+	instance = parrot ? 0 : ATH11K_QMI_WLFW_SERVICE_INS_ID_V01_WCN6750;
+	ret = qmi_add_lookup(&handle, ATH11K_QMI_WLFW_SERVICE_ID_V01, ATH11K_QMI_WLFW_SERVICE_VERS_V01, instance);
 	if (ret < 0 || !wait_for(&wlfw.server, 3000)) {
 		say("wifi: %u: THE SERVICE (%#x, version %u, instance %u) DOES NOT APPEAR within 3 s (lookup: %d)\n", step,
-		    ATH11K_QMI_WLFW_SERVICE_ID_V01, ATH11K_QMI_WLFW_SERVICE_VERS_V01, ATH11K_QMI_WLFW_SERVICE_INS_ID_V01_WCN6750, ret);
+		    ATH11K_QMI_WLFW_SERVICE_ID_V01, ATH11K_QMI_WLFW_SERVICE_VERS_V01, instance, ret);
 		goto out;
 	}
 
-	/* ath11k_qmi_fw_ind_register_send(): this chip's firmware has its memory fixed, so nothing is asked about memory */
+	/* ath11k_qmi_fw_ind_register_send() / ath10k_qmi_ind_register_send_sync_msg() */
 	bzero(&indications, sizeof(indications));
 	bzero(&indications_reply, sizeof(indications_reply));
 	indications.client_id_valid = 1;
 	indications.client_id = QMI_WLANFW_CLIENT_ID;
 	indications.fw_ready_enable_valid = 1;
 	indications.fw_ready_enable = 1;
-	indications.cal_done_enable_valid = 1;
-	indications.cal_done_enable = 1;
-	indications.fw_init_done_enable_valid = 1;
-	indications.fw_init_done_enable = 1;
+	if (parrot) {
+		indications.msa_ready_enable_valid = 1;
+		indications.msa_ready_enable = 1;
+		indications.pin_connect_result_enable_valid = 1;
+		indications.pin_connect_result_enable = 1;
+	} else {
+		indications.cal_done_enable_valid = 1;
+		indications.cal_done_enable = 1;
+		indications.fw_init_done_enable_valid = 1;
+		indications.fw_init_done_enable = 1;
+	}
 	if (!ask("which indications we want", QMI_WLANFW_IND_REGISTER_REQ_V01, QMI_WLANFW_IND_REGISTER_REQ_MSG_V01_MAX_LEN,
 	    qmi_wlanfw_ind_register_req_msg_v01_ei, &indications, qmi_wlanfw_ind_register_resp_msg_v01_ei, &indications_reply,
 	    false)) {
@@ -423,23 +462,49 @@ hakios_wlfw_exchange(uint32_t step)
 		say("wifi: %u:   the firmware's status word: %#llx\n", step, (unsigned long long)indications_reply.fw_status);
 	}
 
-	/* ath11k_qmi_host_cap_send(), for a chip with no m3 image and no sleep clock of its own */
+	/* ath11k_qmi_host_cap_send() / ath10k_qmi_host_cap_send_sync() */
 	bzero(&host, sizeof(host));
 	bzero(&host_reply, sizeof(host_reply));
-	host.num_clients_valid = 1;
-	host.num_clients = 1;
-	host.mem_cfg_mode = 0;
-	host.mem_cfg_mode_valid = 1;
-	host.bdf_support_valid = 1;
-	host.bdf_support = 1;
-	host.cal_done_valid = 1;
-	host.cal_done = 0;
+	if (parrot) {
+		host.num_clients_valid = 1;
+		host.num_clients = 0;	/* daemon_support = 0 */
+	} else {
+		host.num_clients_valid = 1;
+		host.num_clients = 1;
+		host.mem_cfg_mode = 0;
+		host.mem_cfg_mode_valid = 1;
+		host.bdf_support_valid = 1;
+		host.bdf_support = 1;
+		host.cal_done_valid = 1;
+		host.cal_done = 0;
+	}
 	if (!ask("what the host can do", QMI_WLANFW_HOST_CAP_REQ_V01, QMI_WLANFW_HOST_CAP_REQ_MSG_V01_MAX_LEN,
 	    qmi_wlanfw_host_cap_req_msg_v01_ei, &host, qmi_wlanfw_host_cap_resp_msg_v01_ei, &host_reply, false)) {
 		goto out;
 	}
 
-	/* ath11k_qmi_request_target_cap() */
+	if (parrot) {
+		bzero(&msa_info, sizeof(msa_info));
+		bzero(&msa_info_reply, sizeof(msa_info_reply));
+		msa_info.msa_addr = 0x82a00000ULL;
+		msa_info.size = 0x00300000U;
+		if (!ask("MSA memory info", QMI_WLFW_MSA_INFO_REQ_V01, WLFW_MSA_INFO_REQ_MSG_V01_MAX_MSG_LEN,
+		    wlfw_msa_info_req_msg_v01_ei, &msa_info, wlfw_msa_info_resp_msg_v01_ei, &msa_info_reply, false)) {
+			goto out;
+		}
+		for (uint32_t i = 0; i < msa_info_reply.mem_region_info_len && i < QMI_WLFW_MAX_MEM_REG_V01; i++) {
+			say("wifi: %u:   MSA region %u: %#llx, %#x bytes, secure %u\n", step, i,
+			    (unsigned long long)msa_info_reply.mem_region_info[i].region_addr,
+			    msa_info_reply.mem_region_info[i].size, msa_info_reply.mem_region_info[i].secure_flag);
+		}
+		bzero(&msa_ready_reply, sizeof(msa_ready_reply));
+		if (!ask("MSA memory ready", QMI_WLFW_MSA_READY_REQ_V01, WLFW_MSA_READY_REQ_MSG_V01_MAX_MSG_LEN,
+		    wlfw_msa_ready_req_msg_v01_ei, &msa_ready, wlfw_msa_ready_resp_msg_v01_ei, &msa_ready_reply, false)) {
+			goto out;
+		}
+	}
+
+	/* ath11k_qmi_request_target_cap() / ath10k_qmi_cap_send_sync_msg() */
 	bzero(&target, sizeof(target));
 	if (!ask("what the firmware and the chip are", QMI_WLANFW_CAP_REQ_V01, QMI_WLANFW_CAP_REQ_MSG_V01_MAX_LEN,
 	    qmi_wlanfw_cap_req_msg_v01_ei, &what, qmi_wlanfw_cap_resp_msg_v01_ei, &target, false)) {
@@ -448,7 +513,7 @@ hakios_wlfw_exchange(uint32_t step)
 	board_id = target.board_info_valid ? target.board_info.board_id : 0xff;
 	say("wifi: %u:   chip id %#x, chip family %#x (%s); BOARD ID %#x (%s); soc id %#x (%s)\n", step, target.chip_info.chip_id,
 	    target.chip_info.chip_family, target.chip_info_valid ? "given" : "not given", board_id, target.board_info_valid ?
-	    "given" : "not given: ath11k takes 0xff", target.soc_info.soc_id, target.soc_info_valid ? "given" : "not given");
+	    "given" : "not given: driver takes 0xff", target.soc_info.soc_id, target.soc_info_valid ? "given" : "not given");
 	say("wifi: %u:   firmware version %#x, built \"%s\" (%s); BUILD ID \"%s\" (%s)\n", step, target.fw_version_info.fw_version,
 	    target.fw_version_info.fw_build_timestamp, target.fw_version_info_valid ? "given" : "not given", target.fw_build_id,
 	    target.fw_build_id_valid ? "given" : "not given");
@@ -456,6 +521,33 @@ hakios_wlfw_exchange(uint32_t step)
 	    target.num_macs_valid ? " macs" : "", target.voltage_mv_valid ? " voltage" : "", target.time_freq_hz_valid ? " time" : "",
 	    target.otp_version_valid ? " otp" : "", target.eeprom_read_timeout_valid ? " eeprom" : "", target.num_macs,
 	    target.voltage_mv, target.time_freq_hz, target.otp_version, target.eeprom_read_timeout);
+
+	if (parrot) {
+		registers_at = 0x22800000ULL;
+		registers_size = 0x00800000U;
+		say("wifi: %u:   Adrastea SNOC registers at %#llx, %#x bytes\n", step,
+		    (unsigned long long)registers_at, registers_size);
+		send_file("the regulatory database", "regdb.bin", ATH11K_QMI_BDF_TYPE_REGDB, 0);
+		board = send_file("the board's data", "bd17gpt.bin", ATH11K_QMI_BDF_TYPE_BIN, 0);
+		if (!board) {
+			goto out;
+		}
+		bzero(&cal_report_reply, sizeof(cal_report_reply));
+		if (!ask("calibration report", QMI_WLFW_CAL_REPORT_REQ_V01, WLFW_CAL_REPORT_REQ_MSG_V01_MAX_MSG_LEN,
+		    wlfw_cal_report_req_msg_v01_ei, &cal_report, wlfw_cal_report_resp_msg_v01_ei, &cal_report_reply, false)) {
+			goto out;
+		}
+		far = true;
+		if (!wait_for(&wlfw.ready, 10000)) {
+			say("wifi: %u: NO \"FIRMWARE READY\" within 10 s of calibration report\n", step);
+			goto out;
+		}
+		wlfw.init_done = true;
+		if (to_mission) {
+			in_mission = mission();
+		}
+		goto out;
+	}
 
 	/* ath11k_qmi_request_device_info(): where the radio's registers are (the driver maps them from this) */
 	bzero(&device, sizeof(device));

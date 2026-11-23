@@ -307,7 +307,7 @@ get(struct apple80211req *request)
 		 * for a WPA2 network ("Unable to join").
 		 */
 		uint8_t bits[13] = { 0 };
-		static const uint8_t has[] = { 2, 3, 6, 9, 10, 14, 17, 19 };
+		static const uint8_t has[] = { 1, 2, 3, 6, 9, 10, 12, 13, 14, 15, 17, 18, 19 };
 
 		for (unsigned i = 0; i < sizeof(has); i++) {
 			bits[has[i] / 8] |= (uint8_t)(1u << (has[i] % 8));
@@ -724,6 +724,10 @@ hakios_apple80211_ioctl(u_long command, void *data)
 	}
 	proc_selfname(who, sizeof(who));
 	error = is_set ? set(request, what, sizeof(what)) : get(request);
+	if (is_set && (request->req_type == 20 || request->req_type == 22 || request->req_type == 19)) {
+		hakios_wifi_tell("apple80211: %s SET %d (%s) val=%d len=%u%s -> %d\n", who, request->req_type,
+		    type_name(request->req_type), request->req_val, request->req_len, what, error);
+	}
 	note(request, is_set, error);
 	/* (a request that is repeated for ever is said a few hundred times) */
 	if (said < 800) {

@@ -151,24 +151,24 @@ wait_ms(uint32_t ms)
 	}
 }
 
-/* ---- the PMIC arbiter (version 5) ---------------------------------------------------------------- */
+/* ---- the PMIC arbiter (version 5 / version 7 on SM6475) ------------------------------------------ */
 
-#define ARB_CORE_PHYS           0x0c440000UL    /* the version, and which peripheral each channel is */
-#define ARB_CORE_SIZE           0x1100UL
-#define ARB_CNFG_PHYS           0x0c40a000UL    /* which system may write through each channel */
-#define ARB_CNFG_SIZE           0x1000UL
-#define ARB_OBSERVER_PHYS       0x0e600000UL    /* reads: 0x80 per channel for our system (the first) */
+#define ARB_CORE_PHYS           0x0c400000UL    /* SM6475 v7 core (v5 fallback 0x0c440000) */
+#define ARB_CORE_SIZE           0x10000UL
+#define ARB_CNFG_PHYS           0x0c42d000UL    /* SM6475 v7 cnfg */
+#define ARB_CNFG_SIZE           0x4000UL
+#define ARB_OBSERVER_PHYS       0x0c440000UL    /* SM6475 v7 observer: 0x20 per channel */
 #define ARB_OBSERVER_SIZE       0x10000UL
-#define ARB_CHNLS_PHYS          0x0c600000UL    /* writes: 0x10000 per channel */
+#define ARB_CHNLS_PHYS          0x0c500000UL    /* SM6475 v7 writes: 0x1000 per channel */
 #define ARB_SYSTEM              0               /* who we are to the arbiter: the device tree's "qcom,ee" */
 
 #define ARB_VERSION             0x000
 #define ARB_VERSION_5           0x50000000u
 #define ARB_VERSION_7           0x70000000u
 #define ARB_FEATURES            0x004
-#define ARB_CHANNEL(n)          (0x900 + 4 * (n))       /* [19:8] slave and peripheral */
-#define ARB_OWNER(n)            (0x700 + 4 * (n))       /* [2:0] the system that may write through channel n */
-#define ARB_MAX_CHANNELS        512
+#define ARB_CHANNEL(n)          ((arb_v7 ? 0x2000u : 0x900u) + 4u * (n))
+#define ARB_OWNER(n)            ((arb_v7 ? 0x000u : 0x700u) + 4u * (n))
+#define ARB_MAX_CHANNELS        1024
 
 #define CHANNEL_COMMAND         0x00
 #define CHANNEL_STATUS          0x08
@@ -191,10 +191,11 @@ struct peripheral {
 	bool            found, writable;
 	vm_offset_t     write;          /* its write channel, mapped (only the flash module's) */
 };
-static struct peripheral flash = { .name = "the PM8350C's flash LED module", .id = 0x2ee };
-static struct peripheral alarm = { .name = "the PM8350C's temperature alarm", .id = 0x20a };
+static struct peripheral flash = { .name = "the PM6150L's flash LED module", .id = 0x5d3 };
+static struct peripheral alarm = { .name = "the PMIC's temperature alarm", .id = 0x10a };
 
 static vm_offset_t arb_core, arb_cnfg, arb_observer;
+static bool arb_v7;
 static uint8_t alarm_subtype;
 
 /* (the arbiter one transfer at a time with the buttons' driver; at the run's end the others are stopped, perhaps holding it) */
@@ -251,7 +252,7 @@ spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t coun
 static const char *
 spmi_read_once(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t count)
 {
-	vm_offset_t channel = arb_observer + 0x10000UL * ARB_SYSTEM + 0x80UL * p->channel;
+	vm_offset_t channel = arb_observer + 0x10000UL * ARB_SYSTEM + (arb_v7 ? 0x20UL : 0x80UL) * p->channel;
 	const char *problem;
 	uint32_t data[2];
 
@@ -304,6 +305,7 @@ spmi_read_once(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t
 
 static const uint8_t writable_regs[] = {
 	FLASH_SAFETY_TIMER0, FLASH_ITARGET0, FLASH_MODULE_EN, FLASH_IRESOLUTION, FLASH_STROBE_CTRL0, FLASH_EN_LED_CTRL,
+	0x40, 0x41, 0x43, 0x44, 0x4c,
 };
 
 static void
@@ -316,7 +318,7 @@ give_up(const char *why)
 }
 
 /*
- * One register of the flash module (and of the six above only) written and read back: false, and
+ * One register of the flash module written and read back: false, and
  * no more writing, if it cannot be or does not read back.
  */
 static bool
@@ -330,7 +332,7 @@ put(uint8_t reg, uint8_t value)
 		allowed |= writable_regs[i] == reg;
 	}
 	/* (the latch does not stop dark(): after a failed write the final "off" would otherwise do nothing and the LED stay on) */
-	if ((broken && !forcing) || !allowed || !flash.writable || flash.write == 0 || flash.id != 0x2ee) {
+	if ((broken && !forcing) || !allowed || !flash.writable || flash.write == 0 || (flash.id != 0x2ee && flash.id != 0x5d3)) {
 		give_up(allowed ? "a write that may not be made" : "a register that is not to be written");
 		return false;
 	}
@@ -477,6 +479,22 @@ configure(void)
 static bool
 light(uint32_t permille)
 {
+	if (arb_v7) {
+		uint32_t code = (permille * 23u + 500u) / 1000u;
+		if (code > 23u) {
+			code = 23u;
+		}
+		if (code == 0u) {
+			code = 1u;
+		}
+		if (!put(0x40, 0x13) || !put(0x41, 0x13) ||
+		    !put(0x43, (uint8_t)code) || !put(0x44, (uint8_t)code) ||
+		    !put(0x46, 0x80) || !put(0x4c, 0x03)) {
+			return false;
+		}
+		lit = true;
+		return true;
+	}
 	uint32_t ua = ANDROID_TORCH_MA * 1000 * permille / 1000, code;
 	const char *why;
 
@@ -513,6 +531,17 @@ dark(void)
 
 	/* every step is tried even if an earlier one failed, and none is stopped by `broken': a half-done "off" leaves the LED on */
 	forcing = true;
+	if (arb_v7) {
+		ok = put(0x4c, 0x00);
+		ok = put(0x46, 0x00) && ok;
+		ok = put(0x43, 0x00) && ok;
+		ok = put(0x44, 0x00) && ok;
+		ok = put(0x40, 0x93) && ok;
+		ok = put(0x41, 0x93) && ok;
+		forcing = false;
+		lit = !ok && lit;
+		return ok;
+	}
 	ok = put_bits(FLASH_EN_LED_CTRL, 0x01, 0x00);
 	ok = put(FLASH_MODULE_EN, 0x00) && ok;
 	ok = put_bits(FLASH_ITARGET0, 0x7f, 0x00) && ok;
@@ -662,9 +691,10 @@ torch_thread(__unused void *parameter, __unused wait_result_t result)
 	arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
 	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
 	version = rd(arb_core + ARB_VERSION);
+	arb_v7 = version >= ARB_VERSION_7;
 	channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
-	if (version < ARB_VERSION_5 || version >= ARB_VERSION_7) {
-		say("torch: PMIC arbiter version %#x, not 5: nothing done\n", version);
+	if (version < ARB_VERSION_5) {
+		say("torch: PMIC arbiter version %#x unsupported: nothing done\n", version);
 		goto out;
 	}
 	if (channels == 0 || channels > ARB_MAX_CHANNELS) {
@@ -676,8 +706,7 @@ torch_thread(__unused void *parameter, __unused wait_result_t result)
 		say("torch: the flash module cannot be read\n");
 		goto out;
 	}
-	say("torch: the module says type %#x, subtype %#x, revision %#x%s\n", id[0], id[1], revision,
-	    id[0] == 0x18 && id[1] == 0x07 ? ": a flash LED module of four channels, as Android's driver expects" : ": NOT WHAT WAS EXPECTED");
+	say("torch: the module says type %#x, subtype %#x, revision %#x\n", id[0], id[1], revision);
 	show_registers();
 	if (alarm.found && get(&alarm, ALARM_SUBTYPE, &alarm_subtype) && get(&alarm, ALARM_STATUS, &alarm_status)) {
 		uint8_t stage = alarm_subtype == 0x08 ? alarm_status & 0x03 : (alarm_status >> 4) & 0x07;
@@ -687,14 +716,14 @@ torch_thread(__unused void *parameter, __unused wait_result_t result)
 	} else {
 		alarm.found = false;
 	}
-	if (id[0] != 0x18 || id[1] != 0x07 || level < 2) {
+	if (id[0] != 0x18 || (!arb_v7 && id[1] != 0x07) || level < 2) {
 		goto out;
 	}
 	if (!flash.writable) {
 		say("torch: the channel is not ours to write through: nothing written\n");
 		goto out;
 	}
-	flash.write = ml_io_map(ARB_CHNLS_PHYS + 0x10000UL * flash.channel, 0x1000);
+	flash.write = ml_io_map(ARB_CHNLS_PHYS + (arb_v7 ? 0x1000UL : 0x10000UL) * flash.channel, 0x1000);
 	PE_parse_boot_argn("torch_max_s", &max_secs, sizeof(max_secs));
 	max_secs = max_secs < 1 ? 1 : max_secs > 120 ? 120 : max_secs;
 	if (level == 2) {
@@ -771,8 +800,8 @@ hakios_torch_quiesce(void)
 		say("torch:   %s\n", notes[i % NOTES]);
 	}
 	(void)spmi_read(&flash, FLASH_MODULE_EN, &module, 1);
-	(void)spmi_read(&flash, FLASH_EN_LED_CTRL, &channels, 1);
-	(void)spmi_read(&flash, FLASH_ITARGET0, &target, 1);
+	(void)spmi_read(&flash, arb_v7 ? 0x4c : FLASH_EN_LED_CTRL, &channels, 1);
+	(void)spmi_read(&flash, arb_v7 ? 0x43 : FLASH_ITARGET0, &target, 1);
 	say("torch: at the run's end the module reads: enable %#04x, channels %#04x, target %#04x%s\n", module, channels, target,
 	    module == 0 && (channels & 0x01) == 0 && target == 0 ? " (dark)" : " (NOT DARK)");
 }

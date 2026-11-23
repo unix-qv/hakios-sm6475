@@ -120,6 +120,12 @@ void hakios_mic_dsp_down(void) {}
 void hakios_mic_quiesce(void) {}
 #endif
 
+#ifndef HAKIOS_PARROT_AUDIO
+void hakios_parrot_audio_dsp_up(void) {}
+void hakios_parrot_audio_dsp_down(void) {}
+void hakios_parrot_audio_quiesce(void) {}
+#endif
+
 #ifndef HAKIOS_HAPTIC
 void hakios_haptic_init(void) {}
 void hakios_haptic_quiesce(void) {}

@@ -321,23 +321,28 @@ linuxkpi_regulatory_set_wiphy_regd_sync(struct wiphy *wiphy, struct linuxkpi_iee
 	}
 	memcpy(copy, regd, size);
 	lx_os_lock();
-	if (!radio->registered) {
-		lx_os_unlock();
-		kfree(copy);
-		return (-ENODEV);
+	if (radio->registered) {
+		radio->applying++;
 	}
-	radio->applying++;
 	lx_os_unlock();
 	old = radio->regd;
 	radio->regd = copy;
-	wiphy->regd = copy;
 	regd_apply(radio);
 	lx_os_lock();
-	radio->applying--;
-	lx_os_wakeup(&radio->applying);
+	if (radio->applying > 0) {
+		radio->applying--;
+		lx_os_wakeup(&radio->applying);
+	}
 	lx_os_unlock();
 	kfree(old);
 	return (0);
+}
+
+struct linuxkpi_ieee80211_regdomain *
+lkpi_get_linuxkpi_ieee80211_regdomain(size_t n_rules)
+{
+	return (kzalloc(sizeof(struct linuxkpi_ieee80211_regdomain) +
+	    n_rules * sizeof(struct ieee80211_reg_rule), GFP_KERNEL));
 }
 
 /* IEEE 802.11-2020, Annex E: a channel's centre, in MHz */
@@ -467,6 +472,23 @@ linuxkpi_cfg80211_put_bss(struct wiphy *wiphy, struct cfg80211_bss *bss)
 }
 
 /* (nothing is queued for sending: there is nothing to wake, and nothing sent to account for) */
+const uint8_t rfc1042_header[6] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00 };
+
+uint32_t
+linuxkpi_cfg80211_calculate_bitrate(struct rate_info *rate)
+{
+	return (0);
+}
+
+uint8_t
+linuxkpi_ieee80211_get_tid(struct ieee80211_hdr *hdr, bool ack_policy)
+{
+	const uint8_t *f = (const uint8_t *)hdr;
+	unsigned control = f[0] | f[1] << 8;
+
+	return (f[(control & 0x0300) == 0x0300 ? 30 : 24] & 0x0f);
+}
+
 void
 linuxkpi_ieee80211_wake_queues(struct ieee80211_hw *hw)
 {
@@ -475,6 +497,49 @@ linuxkpi_ieee80211_wake_queues(struct ieee80211_hw *hw)
 void
 linuxkpi_ieee80211_stop_queues(struct ieee80211_hw *hw)
 {
+}
+
+void
+linuxkpi_ieee80211_wake_queue(struct ieee80211_hw *hw, int qnum)
+{
+}
+
+void
+linuxkpi_ieee80211_stop_queue(struct ieee80211_hw *hw, int qnum)
+{
+}
+
+void
+linuxkpi_ieee80211_txq_schedule_start(struct ieee80211_hw *hw, uint8_t ac)
+{
+}
+
+struct ieee80211_txq *
+linuxkpi_ieee80211_next_txq(struct ieee80211_hw *hw, uint8_t ac)
+{
+	return (NULL);
+}
+
+void
+linuxkpi_ieee80211_schedule_txq(struct ieee80211_hw *hw, struct ieee80211_txq *txq, bool withoutpkts)
+{
+}
+
+struct sk_buff *
+linuxkpi_ieee80211_tx_dequeue(struct ieee80211_hw *hw, struct ieee80211_txq *txq)
+{
+	return (NULL);
+}
+
+void
+linuxkpi_ieee80211_txq_get_depth(struct ieee80211_txq *txq, unsigned long *frame_cnt, unsigned long *byte_cnt)
+{
+	if (frame_cnt != NULL) {
+		*frame_cnt = 0;
+	}
+	if (byte_cnt != NULL) {
+		*byte_cnt = 0;
+	}
 }
 
 void
@@ -1377,8 +1442,8 @@ protection(const struct lx_target *target, unsigned *group_cipher)
 	for (; count != 0 && end - at >= 4; count--, at += 4) {
 		passphrase |= at[0] == 0x00 && at[1] == 0x0f && at[2] == 0xac && at[3] == 2;
 	}
-	if (*group_cipher != 4) {
-		return ("it ciphers frames to everybody with something other than CCMP (TKIP, for old stations), which is not done here");
+	if (*group_cipher != 4 && *group_cipher != 2) {
+		return ("it ciphers frames to everybody with something other than CCMP or TKIP, which is not done here");
 	}
 	if (!ccmp) {
 		return ("it does not offer CCMP");
@@ -1392,24 +1457,35 @@ protection(const struct lx_target *target, unsigned *group_cipher)
 	return (NULL);
 }
 
-/* A key for the driver to give the firmware: CCMP, for frames between us and the access point or for the group's. */
+/* A key for the driver to give the firmware: CCMP (16 bytes) or TKIP group key (32 bytes). */
 static struct ieee80211_key_conf *
-key_set(struct lx_radio *radio, const uint8_t *key, unsigned index, bool pairwise, int *error)
+key_set(struct lx_radio *radio, const uint8_t *key, unsigned keylen, unsigned index, bool pairwise, int *error)
 {
-	struct ieee80211_key_conf *conf = kzalloc(sizeof(*conf) + 16, GFP_KERNEL);
+	struct ieee80211_key_conf *conf;
 
+	if (keylen != 16 && keylen != 32) {
+		*error = -EINVAL;
+		return (NULL);
+	}
+	conf = kzalloc(sizeof(*conf) + keylen, GFP_KERNEL);
 	if (conf == NULL) {
 		*error = -ENOMEM;
 		return (NULL);
 	}
-	conf->cipher = WLAN_CIPHER_SUITE_CCMP;
+	if (!pairwise && keylen == 32) {
+		conf->cipher = WLAN_CIPHER_SUITE_TKIP;
+		conf->iv_len = 8;
+		conf->icv_len = 4;
+	} else {
+		conf->cipher = WLAN_CIPHER_SUITE_CCMP;
+		conf->iv_len = 8;
+		conf->icv_len = 8;
+	}
 	conf->keyidx = (uint8_t)index;
-	conf->keylen = 16;
-	conf->iv_len = 8;
-	conf->icv_len = 8;
+	conf->keylen = (uint8_t)keylen;
 	conf->flags = pairwise ? IEEE80211_KEY_FLAG_PAIRWISE : 0;
 	conf->link_id = -1;
-	memcpy(conf->key, key, 16);
+	memcpy(conf->key, key, keylen);
 	mutex_lock(&radio->wiphy->mtx);
 	*error = radio->ops->set_key(&radio->hw, SET_KEY, radio->vif, pairwise ? radio->sta : NULL, conf);
 	mutex_unlock(&radio->wiphy->mtx);
@@ -1423,7 +1499,7 @@ key_drop(struct lx_radio *radio, struct ieee80211_key_conf **conf, bool pairwise
 		mutex_lock(&radio->wiphy->mtx);
 		radio->ops->set_key(&radio->hw, DISABLE_KEY, radio->vif, pairwise ? radio->sta : NULL, *conf);
 		mutex_unlock(&radio->wiphy->mtx);
-		explicit_bzero((*conf)->key, 16);
+		explicit_bzero((*conf)->key, (*conf)->keylen);
 		kfree(*conf);
 		*conf = NULL;
 	}
@@ -1438,7 +1514,7 @@ group_rekey(struct work_struct *work)
 	int error = 0;
 
 	radio->rekeys++;
-	fresh = key_set(radio, radio->wpa.group, radio->wpa.group_index, false, &error);
+	fresh = key_set(radio, radio->wpa.group, radio->wpa.group_length, radio->wpa.group_index, false, &error);
 	lx_tell("lx: the group's new key (number %u) is given to the driver: %d\n", radio->wpa.group_index, error);
 	if (error != 0) {
 		/*
@@ -1446,7 +1522,7 @@ group_rekey(struct work_struct *work)
 		 * new configuration, which key_set() returns even then, is wiped and freed; nothing was installed to disable.
 		 */
 		if (fresh != NULL) {
-			explicit_bzero(fresh->key, 16);
+			explicit_bzero(fresh->key, fresh->keylen);
 			kfree(fresh);
 		}
 		return;
@@ -1848,9 +1924,9 @@ station_join(struct lx_radio *radio, const struct hakios_sta_join *what)
 		goto out;
 	}
 	lx_pause_ms(30);			/* (for message 4 to have left unciphered, before there is a key to cipher with) */
-	radio->pairwise_key = key_set(radio, radio->wpa.pairwise, 0, true, &ret);
+	radio->pairwise_key = key_set(radio, radio->wpa.pairwise, 16, 0, true, &ret);
 	if (ret == 0) {
-		radio->group_key = key_set(radio, radio->wpa.group, radio->wpa.group_index, false, &ret);
+		radio->group_key = key_set(radio, radio->wpa.group, radio->wpa.group_length, radio->wpa.group_index, false, &ret);
 	}
 	lx_tell("lx: THE KEYS ARE GIVEN TO THE DRIVER, %llu ms after the association: ours with the access point, and the group's "
 	    "(number %u, %u bytes): %d\n", (lx_os_nanoseconds() - began) / 1000000ull, radio->wpa.group_index,

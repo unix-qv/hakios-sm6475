@@ -429,7 +429,7 @@ group_key(struct lx_wpa *wpa, const uint8_t *data, unsigned length, const uint8_
 		 * is not installed with stale bytes of `group` filling it out.
 		 */
 		if (e[0] == 0xdd && e[1] >= 6 + 5 && e[2] == 0x00 && e[3] == 0x0f && e[4] == 0xac && e[5] == 1 &&
-		    e[1] - 6u == 16 && (e[6] & 3) != 0) {
+		    (e[1] - 6u == 16 || e[1] - 6u == 32) && (e[6] & 3) != 0) {
 			wpa->group_index = e[6] & 3;
 			wpa->group_length = e[1] - 6u;
 			memcpy(wpa->group, e + 8, wpa->group_length);

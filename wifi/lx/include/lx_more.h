@@ -6,11 +6,20 @@
 #define _LX_MORE_H_
 
 #include <linux/types.h>
+#include <linux/delay.h>
+#include <linux/cleanup.h>
+#include <linux/spinlock.h>
 #include <linux/interrupt.h>
 #include <linux/dma-mapping.h>
 #include <linux/module.h>
 #include <linux/ieee80211.h>
 #include <net/cfg80211.h>
+
+DEFINE_LOCK_GUARD_1(spinlock_bh, spinlock_t, spin_lock_bh(_T->lock), spin_unlock_bh(_T->lock))
+
+struct nvmem_cell;
+static inline struct nvmem_cell *devm_nvmem_cell_get(struct device *dev, const char *id) { return (ERR_PTR(-ENOENT)); }
+static inline void *nvmem_cell_read(struct nvmem_cell *cell, size_t *len) { return (ERR_PTR(-ENOENT)); }
 
 /* --- interrupts: how the line is triggered is the kernel's knowledge, not the driver's */
 #define IRQF_TRIGGER_RISING	0x0001

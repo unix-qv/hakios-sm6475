@@ -1,1 +1,1 @@
-debug=0x8 rd=md0 hv_wdt_pet=1 bootcpu=7 cpus=8 fb_hz=120 fb_threads=4 buttons=1 touchscreen=1
+rd=md0 bootcpu=7 cpus=8 cpufreq=1 fb_hz=120 fb_threads=4 buttons=1 touchscreen=1 torch=3 adsp=1 parrot_audio=4 wifi=1 debug=0x8 hv_wdt_pet=1

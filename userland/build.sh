@@ -539,9 +539,10 @@ fi
 # board data and the regulatory database (image/qca6750 there; 60 and 24 KB)
 if [ -f ../fw-wifi/wpss.mdt ]; then
 	mkdir -p root/fw
-	install -m 0644 ../fw-wifi/wpss.mdt ../fw-wifi/wpss.b0[2-9] root/fw/
-	for f in bd_m20gl.elf regdb_xiaomi.bin; do
+	install -m 0644 ../fw-wifi/wpss.mdt ../fw-wifi/wpss.b0[0-9] ../fw-wifi/wpss.b[1-9][0-9] root/fw/
+	for f in bd_m20gl.elf regdb_xiaomi.bin bd17gpt.bin bdwlan.bin regdb.bin; do
 		[ -f ../fw-wifi/qca6750/$f ] && install -m 0644 ../fw-wifi/qca6750/$f root/fw/
+		[ -f ../fw-wifi/$f ] && install -m 0644 ../fw-wifi/$f root/fw/
 	done
 	# the network the radio is to join: its name on the first line, its passphrase on the second. Yours, and
 	# so not in the repository; it goes where the firmware goes and the kernel reads it there (wifi_join=1)
@@ -578,7 +579,7 @@ done
 # the loader takes.
 if [ -n "$ADSP" ] && [ -f ../fw-audio/adsp.mdt ]; then
 	mkdir -p root/fw
-	install -m 0644 ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] root/fw/
+	install -m 0644 ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[0-9] ../fw-audio/adsp.b[1-9][0-9] root/fw/
 fi
 # Firmware that is not there is otherwise silent at build time and speaks only much later, deep in a
 # device log -- "adreno: THE GPU IS NOT STARTED: the small image has no fw/a660_gmu.bin" cost a phone
@@ -666,7 +667,7 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	# from the Darwin volume's /fw, which src/init.c (flash_root) binds to this
 	if [ -f ../fw-audio/adsp.mdt ]; then
 		mkdir -p flashboot/fw
-		cp ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] flashboot/fw/
+		cp ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[0-9] ../fw-audio/adsp.b[1-9][0-9] flashboot/fw/
 	fi
 	if [ -f ../fw-audio/aw882xx_acf.bin ]; then
 		mkdir -p flashboot/fw
@@ -675,7 +676,7 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 	# the package manager's prefix, when tools/mk-jb.sh has fetched one: /jb of the boot volume, which is
 	# /private/preboot/jb once the Darwin volume is the root -- the volume where a rootless jailbreak keeps its
 	# Procursus on an iPhone as well; init grafts it onto /var/jb (src/init.c, mount_writable)
-	if [ -d ../jb/root/var/jb ]; then
+	if [ "${JB-1}" != 0 ] && [ -d ../jb/root/var/jb ]; then
 		cp -a ../jb/root/var/jb flashboot/jb
 		mkdir -p flashboot/jb-rw        # where init mounts the prefix's writable copy (src/init.c)
 		# and what Sileo runs from /bin, for init to put over the Darwin volume's /bin (see the system image below)
@@ -705,7 +706,7 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
 fi
 
 # --- the system image -----------------------------------------------------------------------------
-if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
+if [ -z "$ROOT_ONLY" ] && [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	{ [ ! -f system.apfs ] || [ obj/stage0 -nt system.apfs ] || [ $DARWIN/system.manifest -nt system.apfs ] ||
 	  [ $DARWIN/cryptex -nt system.apfs ] || [ $DARWIN/cryptex-app -nt system.apfs ] || [ -n "$SYSTEM" ]; }; then
 	# what sysimage/select-system.py has chosen since sysimage/rootfs was extracted is not in it, and would not be
@@ -740,7 +741,7 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# it once the root is mounted (drivers/audio/hakios.adsp.c, adsp=1): 20 MB that do not fit beside GL=1 in the small image
 	if [ -f ../fw-audio/adsp.mdt ]; then
 		mkdir -p sysroot/fw
-		cp ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] sysroot/fw/
+		cp ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[0-9] ../fw-audio/adsp.b[1-9][0-9] sysroot/fw/
 	fi
 	# MPSS firmware is much too large for the small boot image. Keep it in the system APFS,
 	# only when explicitly requested, after checking every loadable segment against this DTB.
@@ -766,7 +767,7 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	# the package manager's prefix, when tools/mk-jb.sh has fetched one: the Procursus bootstrap with
 	# Sileo in it, as /jb. It cannot live at /var/jb in the image -- /private/var is a memory
 	# filesystem made afresh at every boot -- so init copies it there (src/init.c, copy_tree).
-	if [ -d ../jb/root/var/jb ]; then
+	if [ "${JB-1}" != 0 ] && [ -d ../jb/root/var/jb ]; then
 		rm -rf sysroot/jb
 		cp -a ../jb/root/var/jb sysroot/jb
 		# the applications of the prefix are system applications here: LaunchServices builds its
@@ -785,7 +786,7 @@ if [ -f $DARWIN/system.manifest ] && [ -f $CACHE/dyld_shared_cache_arm64 ] &&
 	fi
 	# our audio device, where the audio server looks for such plug-ins (and for no others: Apple's are left out)
 	mkdir -p sysroot/System/Library/Audio/Plug-Ins/HAL
-	ln -s /redwood/lib/HakiosAudio.driver sysroot/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver
+	ln -sfn /redwood/lib/HakiosAudio.driver sysroot/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver
 	# the plug-in Metal opens when the accelerator names it (boot-arg metal=1; without it nothing names this bundle)
 	rm -rf sysroot/usr/local/redwood
 	[ -d big ] && mkdir -p sysroot/usr/local && cp -a big sysroot/usr/local/redwood

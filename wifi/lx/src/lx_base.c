@@ -25,6 +25,7 @@
 
 #include <linux/bottom_half.h>
 #include <linux/completion.h>
+#include <linux/device.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmi.h>
 #include <linux/firmware.h>
@@ -32,6 +33,7 @@
 #include <linux/io.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
+#include <linux/netdevice.h>
 #include <linux/rhashtable.h>
 #include <linux/sched.h>
 #include <linux/skbuff.h>
@@ -1212,6 +1214,111 @@ const struct dmi_system_id *
 linux_dmi_first_match(const struct dmi_system_id *list)
 {
 	return (NULL);				/* (no table of the machine's maker here) */
+}
+
+void
+DELAY(int usec)
+{
+	unsigned long long until = lx_os_nanoseconds() + (unsigned long long)(usec > 0 ? usec : 0) * 1000ull;
+
+	if (usec >= 1000) {
+		lx_pause_ms((unsigned)(usec / 1000));
+		return;
+	}
+	while (lx_os_nanoseconds() < until) {
+	}
+}
+
+int
+pause_sbt(const char *wmesg, sbintime_t sbt, sbintime_t pr, int flags)
+{
+	unsigned ms = (unsigned)((sbt * 1000) >> 32);
+
+	lx_pause_ms(ms > 0 ? ms : 1);
+	return (0);
+}
+
+void
+nanouptime(struct timespec *tsp)
+{
+	unsigned long long ns = lx_os_nanoseconds();
+
+	tsp->tv_sec = (time_t)(ns / 1000000000ull);
+	tsp->tv_nsec = (long)(ns % 1000000000ull);
+}
+
+void *
+lkpi_devres_alloc(void (*release)(struct device *, void *), size_t size, gfp_t gfp)
+{
+	void *p = lkpi_kmalloc(size, gfp);
+
+	if (p != NULL && (gfp & __GFP_ZERO)) {
+		bzero(p, size);
+	}
+	return (p);
+}
+
+void
+lkpi_devres_add(struct device *dev, void *p)
+{
+}
+
+void
+lkpi_devm_kmalloc_release(struct device *dev, void *p)
+{
+	lkpi_kfree(p);
+}
+
+struct sk_buff *
+linuxkpi_skb_copy(const struct sk_buff *skb, gfp_t gfp)
+{
+	struct sk_buff *copy = linuxkpi_dev_alloc_skb(skb->len + 128, gfp);
+
+	if (copy == NULL) {
+		return (NULL);
+	}
+	skb_reserve(copy, 64);
+	memcpy(skb_put(copy, skb->len), skb->data, skb->len);
+	memcpy(copy->cb, skb->cb, sizeof(copy->cb));
+	return (copy);
+}
+
+struct net_device *
+linuxkpi_alloc_netdev(size_t priv_size, const char *name, uint32_t flags, void (*setup)(struct net_device *))
+{
+	struct net_device *ndev = lkpi_kmalloc(sizeof(*ndev) + priv_size, GFP_KERNEL);
+
+	if (ndev != NULL) {
+		bzero(ndev, sizeof(*ndev) + priv_size);
+		if (setup != NULL) {
+			setup(ndev);
+		}
+	}
+	return (ndev);
+}
+
+void
+linuxkpi_free_netdev(struct net_device *ndev)
+{
+	lkpi_kfree(ndev);
+}
+
+void
+linuxkpi_napi_enable(struct napi_struct *napi)
+{
+	clear_bit(LKPI_NAPI_FLAG_DISABLE_PENDING, &napi->state);
+}
+
+void
+linuxkpi_napi_disable(struct napi_struct *napi)
+{
+	set_bit(LKPI_NAPI_FLAG_DISABLE_PENDING, &napi->state);
+	clear_bit(LKPI_NAPI_FLAG_IS_SCHEDULED, &napi->state);
+}
+
+void
+linuxkpi_napi_synchronize(struct napi_struct *napi)
+{
 }
 
 /* What the layer holds of the kernel's memory right now: a number that keeps growing is a leak. */

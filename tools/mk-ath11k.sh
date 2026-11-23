@@ -114,7 +114,7 @@ if [ ! -d gen ]; then
 fi
 
 # --- compile: the driver's files that are built so far, and ours
-DRIVER="core hal qmi ce hw fw htc wmi mac reg peer dp dp_rx dp_tx hal_rx hal_tx dbring p2p"
+DEVICE_CFG=$(grep '^CONFIG_DEVICE=' "$ROOT/.config" 2>/dev/null | cut -d'"' -f2)
 CC="clang -target arm64-apple-ios16.5"
 LD=$ROOT/xnu-deps/host/bin/ld64
 CFLAGS="-mkernel -mgeneral-regs-only -fno-builtin -fno-common -ffreestanding -fno-strict-aliasing
@@ -123,8 +123,25 @@ CFLAGS="-mkernel -mgeneral-regs-only -fno-builtin -fno-common -ffreestanding -fn
 	-I$W/include -Igen -I$S -I$S/contrib/ck/include
 	-I$S/compat/linuxkpi/common/include -I$S/compat/linuxkpi/dummy/include
 	-include $S/compat/linuxkpi/common/include/linux/kconfig.h -DLINUXKPI_VERSION=70000"
-DFLAGS="-Isrc/ath11k -Isrc -include $W/include/lx_prelude.h -DCONFIG_ATH11K_AHB -DCONFIG_ATH11K_DEBUG
-	-DKBUILD_MODNAME=\"ath11k\""
+if [ "$DEVICE_CFG" = parrot ]; then
+	if [ ! -f src/ath10k/core.c ]; then
+		tar xJf linux-$VERSION.tar.xz -C src --strip-components=4 \
+			linux-$VERSION/$ATH/ath10k \
+			linux-$VERSION/$ATH/ath.h \
+			linux-$VERSION/$ATH/regd.h \
+			linux-$VERSION/$ATH/regd_common.h \
+			linux-$VERSION/$ATH/regd.c \
+			linux-$VERSION/$ATH/dfs_pattern_detector.h \
+			linux-$VERSION/$ATH/dfs_pri_detector.h
+	fi
+	DRIVER="core ce hw htc htt htt_rx htt_tx txrx wmi wmi-tlv mac p2p qmi qmi_wlfw_v01 bmi swap"
+	DFLAGS="-Isrc/ath10k -Isrc -include $W/include/lx_prelude.h -DLX_ATH10K -DCONFIG_ATH10K_SNOC -DCONFIG_ATH10K_DEBUG
+		-DKBUILD_MODNAME=\"ath10k\""
+else
+	DRIVER="core hal qmi ce hw fw htc wmi mac reg peer dp dp_rx dp_tx hal_rx hal_tx dbring p2p"
+	DFLAGS="-Isrc/ath11k -Isrc -include $W/include/lx_prelude.h -DCONFIG_ATH11K_AHB -DCONFIG_ATH11K_DEBUG
+		-DKBUILD_MODNAME=\"ath11k\""
+fi
 # two headers are the kernel's: what it offers this object (wifi/lx/include/lx_os.h), and its QMI
 # helpers (wifi/lx/include/linux/soc/qcom/qmi.h)
 source "$ROOT/xnu-env.sh"
@@ -142,15 +159,23 @@ compile() {		# compile SOURCE OBJECT [FLAGS]: only when the object is older than
 	fi
 	$CC $CFLAGS "$@" -MMD -MF "$obj.d" -c "$src" -o "$obj" 2> "$obj.err" || rm -f "$obj"
 }
-for f in $DRIVER; do compile src/ath11k/$f.c obj/ath11k_$f.o $DFLAGS & done
-for f in "$W"/src/*.c; do [ -f "$f" ] && compile "$f" obj/lx_$(basename "$f" .c).o $DFLAGS -I$W/src & done
-wait
+if [ "$DEVICE_CFG" = parrot ]; then
+	for f in $DRIVER; do compile src/ath10k/$f.c obj/ath10k_$f.o $DFLAGS & done
+	compile src/regd.c obj/ath_regd.o $DFLAGS &
+	for f in "$W"/src/*.c; do [ -f "$f" ] && compile "$f" obj/lx10_$(basename "$f" .c).o $DFLAGS -I$W/src & done
+	wait
+	OBJECTS="$(for f in $DRIVER; do echo obj/ath10k_$f.o; done) obj/ath_regd.o $(for f in "$W"/src/*.c; do echo obj/lx10_$(basename "$f" .c).o; done)"
+else
+	for f in $DRIVER; do compile src/ath11k/$f.c obj/ath11k_$f.o $DFLAGS & done
+	for f in "$W"/src/*.c; do [ -f "$f" ] && compile "$f" obj/lx_$(basename "$f" .c).o $DFLAGS -I$W/src & done
+	wait
+	OBJECTS=$(for f in $DRIVER; do echo obj/ath11k_$f.o; done; for f in "$W"/src/*.c; do echo obj/lx_$(basename "$f" .c).o; done)
+fi
 bad=
 for f in obj/*.err; do
 	[ -s "$f" ] && [ ! -f "${f%.err}" ] && { echo "--- $(basename "$f" .o.err)"; grep -m6 -A3 "error:" "$f"; bad=1; }
 done
 [ -z "$bad" ] || exit 1
-OBJECTS=$(for f in $DRIVER; do echo obj/ath11k_$f.o; done; for f in "$W"/src/*.c; do echo obj/lx_$(basename "$f" .c).o; done)
 
 # --- tie it all into one object. What it then still wants is one of three things: a call of the
 # kernel's (hakios.lx.h; the QMI helpers; the handful of C library functions XNU has under the same
@@ -168,7 +193,7 @@ for s in $(cat out/undefined.txt); do
 	case " $(echo $KERNEL) " in *" $s "*) continue ;; esac
 	case $s in
 	lx_os_*|qmi_*|hakios_qmi_*|section\$*) continue ;;
-	ath11k_*|__ath11k_*) ;;
+	ath11k_*|__ath11k_*|ath10k_*|__ath10k_*|_ath10k_*) ;;
 	*) echo "mk-ath11k.sh: nothing defines $s" >&2; missing=1; continue ;;
 	esac
 	echo $s >> out/stubs.txt

@@ -192,6 +192,7 @@ static uint32_t last_step, pause_ms = 2200, fine, watch_seconds = 3;
 static uint32_t step;                   /* the one being performed */
 static uint32_t new_from;               /* the first of the steps that have not been seen to work: they wait */
 static char last_write[96] = "nothing written";
+static bool parrot_wifi;                /* SM6475 / POCO M8 5G (Adrastea / icnss@22800000) */
 
 /* As in hakios.adreno.c: every line goes to the log the loader reads from another core as well. */
 extern void loader_log_putc(char c);
@@ -1003,11 +1004,142 @@ show_rpmh_resource(const char *name, const char *what)
 static struct block rsc = { "rsc", 0x18220000, 0x10000 };
 #define RSC_ID                  0x000           /* [23:16] the major version: the layout below is that of versions before 3 */
 #define RSC_CONFIG              0x00c           /* per DRV six bits, the number of its TCSs; [31:27] commands in a TCS */
+#define RSC_TCS_BASE            0xd00
+#define RSC_IRQ_STATUS          (RSC_TCS_BASE + 0x04)
+#define RSC_IRQ_CLEAR           (RSC_TCS_BASE + 0x08)
 #define RSC_TCS(n)              (0xd00 + 672 * (n))             /* dt: qcom,tcs-offset */
+#define TCS_WAIT_FOR_DONE       0x10
 #define TCS_CONTROL             0x14
 #define TCS_STATUS              0x18
 #define TCS_ENABLED             0x1c            /* a bit per command */
 #define TCS_COMMAND(c)          (0x30 + 20 * (c))               /* its flags; then its address, its value, its status */
+#define TCS_ACTIVE_MODE         (1u << 16)
+#define TCS_TRIGGER             (1u << 24)
+#define MSGID_WRITE_WAITED      (8u | 1u << 8 | 1u << 16)
+#define RPMH_TCS                0
+
+static bool
+parrot_rpmh_send(const uint32_t *addrs, const uint32_t *vals, unsigned count)
+{
+	uint32_t mask = (1u << count) - 1u, done = 0;
+	uint64_t began;
+
+	if (count == 0 || count > 16) {
+		return false;
+	}
+	need(&rsc);
+	if (!leaving) {
+		lck_mtx_lock(&hakios_rsc_lock);
+	}
+	for (unsigned i = 0; i < 2000 && rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS) == 0; i++) {
+		sleep_us(50);
+	}
+	if (rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_STATUS) == 0) {
+		printf("wifi: %u: RPMh TCS0 busy\n", step);
+		if (!leaving) {
+			lck_mtx_unlock(&hakios_rsc_lock);
+		}
+		return false;
+	}
+	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
+	for (unsigned i = 0; i < count; i++) {
+		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(i), MSGID_WRITE_WAITED);
+		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(i) + 4, addrs[i]);
+		wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_COMMAND(i) + 8, vals[i]);
+	}
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_WAIT_FOR_DONE, mask);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, mask);
+	settle();
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~TCS_TRIGGER);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) | TCS_ACTIVE_MODE);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) | TCS_TRIGGER);
+	began = now_us();
+	while (now_us() - began < 100000) {
+		done = rd(rsc.base + RSC_IRQ_STATUS) & (1u << RPMH_TCS);
+		if (done) {
+			break;
+		}
+		sleep_us(50);
+	}
+	wr(rsc.base + RSC_IRQ_CLEAR, 1u << RPMH_TCS);
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL, rd(rsc.base + RSC_TCS(RPMH_TCS) + TCS_CONTROL) & ~(TCS_TRIGGER | TCS_ACTIVE_MODE));
+	wr(rsc.base + RSC_TCS(RPMH_TCS) + TCS_ENABLED, 0);
+	if (!leaving) {
+		lck_mtx_unlock(&hakios_rsc_lock);
+	}
+	return done != 0;
+}
+
+static int
+parrot_rail_pos(const char *name, uint32_t level, uint32_t *addr_out)
+{
+	const struct cmd_db_entry *entry = rpmh_resource(name, 0);
+
+	if (entry == NULL) {
+		return -1;
+	}
+	*addr_out = entry->address;
+	for (unsigned s = 0; s < 8; s++) {
+		const struct cmd_db_slave *slave = &cmd_db->slave[s];
+		const struct cmd_db_entry *first = (const struct cmd_db_entry *)(cmd_db->data + slave->header_offset);
+
+		if (entry < first || entry >= first + slave->count ||
+		    (unsigned)slave->data_offset + entry->offset + entry->length > CMD_DB_SIZE - 0x1000) {
+			continue;
+		}
+		const uint8_t *data = cmd_db->data + slave->data_offset + entry->offset;
+		for (unsigned l = 0; l < entry->length / 2u && l < 16; l++) {
+			if ((uint32_t)(data[2 * l] | data[2 * l + 1] << 8) >= level) {
+				return (int)l;
+			}
+		}
+	}
+	return -1;
+}
+
+static void
+parrot_wifi_power(bool on)
+{
+	static const struct {
+		const char *name;
+		uint32_t mv;
+	} vrms[] = {
+		{ "ldob11", 752 },
+		{ "ldoe1", 1800 },
+		{ "ldob14", 1304 },
+		{ "ldoe10", 3304 },
+		{ "ldoe11", 3304 },
+	};
+	uint32_t addrs[3], vals[3];
+
+	if (!parrot_wifi) {
+		return;
+	}
+	if (on) {
+		int p_cx = parrot_rail_pos("cx.lvl", 384, &addrs[0]);
+		int p_mx = parrot_rail_pos("mx.lvl", 384, &addrs[1]);
+		if (p_cx >= 0 && p_mx >= 0) {
+			vals[0] = (uint32_t)p_cx;
+			vals[1] = (uint32_t)p_mx;
+			bool ok = parrot_rpmh_send(addrs, vals, 2);
+			printf("wifi: %u: RPMh cx.lvl=%d mx.lvl=%d (level 384): %s\n", step, p_cx, p_mx, ok ? "ok" : "FAIL");
+		}
+		for (unsigned i = 0; i < sizeof(vrms) / sizeof(vrms[0]); i++) {
+			const struct cmd_db_entry *e = rpmh_resource(vrms[i].name, 0);
+			if (e == NULL) {
+				continue;
+			}
+			addrs[0] = e->address + 0x0;
+			vals[0] = vrms[i].mv;
+			addrs[1] = e->address + 0x8;
+			vals[1] = 4;
+			addrs[2] = e->address + 0x4;
+			vals[2] = 1;
+			bool ok = parrot_rpmh_send(addrs, vals, 3);
+			printf("wifi: %u: RPMh VRM %s (%#x) %u mV: %s\n", step, vrms[i].name, e->address, vrms[i].mv, ok ? "ok" : "FAIL");
+		}
+	}
+}
 
 static bool
 step_rpmh(void)
@@ -1273,8 +1405,16 @@ step_pins(void)
 /* ---- step 6: the firmware ------------------------------------------------------------------------------ */
 
 #define PAS_WPSS                6               /* dt: qcom,pas-id of qcom,wpss@8a00000 */
-#define WPSS_MEMORY             0x9ae00000u     /* dt: reserved-memory wlan@9ae00000, that node's memory-region */
-#define WPSS_MEMORY_SIZE        0x01900000u
+static uint32_t wpss_memory = 0x9ae00000u;      /* dt: reserved-memory wlan@9ae00000 or wpss_region@85300000 */
+static uint32_t wpss_memory_size = 0x01900000u;
+#define WPSS_MEMORY             wpss_memory
+#define WPSS_MEMORY_SIZE        wpss_memory_size
+
+bool
+hakios_wifi_is_parrot(void)
+{
+	return parrot_wifi;
+}
 
 extern dev_t mdevlookup(int devid);
 extern int mdevgetkernelrange(dev_t dev, vm_offset_t *base, uint64_t *size);
@@ -1437,7 +1577,7 @@ doorbells(void)
 	for (unsigned i = 0; i < 8; i++) {
 		uint32_t who = rd(ipcc.base + IPCC_RECEIVED);
 
-		if (who == IPCC_NOBODY) {
+		if (who == IPCC_NOBODY || (who >> 16) == 3u) {
 			return;
 		}
 		wr(ipcc.base + IPCC_CLEAR, who);
@@ -2159,6 +2299,7 @@ step_start(void)
 	}
 	/* (the boot chain listens for the DSP's GLINK ring and no other: without this an SMP2P ring leaves no trace) */
 	put(&ipcc, "listened for", IPCC_ENABLE, IPCC_WPSS << 16 | IPCC_SMP2P);
+	parrot_wifi_power(true);
 	bzero(&doorbell, sizeof(doorbell));
 	lck_mtx_lock(&dsp_lock);
 	if (!mailbox_send("{class: image, res: load_state, name: wpss, val: on}")) {
@@ -3479,7 +3620,7 @@ step_registers(void)
 	 * 2 MB it is said to be, or the map below would cover whatever lies there.
 	 */
 	if (!hakios_wlfw_registers(&address, &size, &mission) || address > 0xffffffffull || size < 3 * RADIO_WINDOW ||
-	    size > 4 * RADIO_WINDOW || address + size > 0x100000000ull) {
+	    size > 0x800000u || address + size > 0x100000000ull) {
 		printf("wifi: %u: the firmware has not said where the radio's registers are (step 15)\n", step);
 		return false;
 	}
@@ -3501,6 +3642,26 @@ step_registers(void)
 	if (radio.base == 0) {
 		printf("wifi: %u: the radio's registers could not be mapped\n", step);
 		return false;
+	}
+	if (parrot_wifi) {
+		static const struct {
+			uint32_t off;
+			const char *name;
+		} snoc_words[] = {
+			{ 0x240000 + 0x00, "CE0 source ring base (low)" },
+			{ 0x240000 + 0x04, "CE0 source ring size" },
+			{ 0x240000 + 0x3c, "CE0 source write index" },
+			{ 0x241000 + 0x10, "CE1 dest ring base (low)" },
+			{ 0x242000 + 0x10, "CE2 dest ring base (low)" },
+			{ 0x243000 + 0x00, "CE3 source ring base (low)" },
+			{ 0x244000 + 0x00, "CE4 source ring base (low)" },
+		};
+		for (unsigned i = 0; i < sizeof(snoc_words) / sizeof(snoc_words[0]); i++) {
+			uint32_t at = snoc_words[i].off;
+			printf("wifi: %u: THE RADIO'S %s (%#x) = %#x\n", step, snoc_words[i].name, radio.phys + at, rd(radio.base + at));
+		}
+		ml_io_unmap(radio.base, radio.size);
+		return true;
 	}
 	for (unsigned i = 0; i < sizeof(words) / sizeof(words[0]); i++) {
 		uint32_t chip = words[i].chip, at;
@@ -3592,7 +3753,8 @@ static struct block apps_smmu = { "apps smmu", 0x15000000, 0x2000 };
 #define SMMU_IDR1               0x024           /* bit 31: 64K pages, [30:28] log2(pages)-1, [7:0] translation contexts */
 #define SMMU_SMR(n)             (0x800 + 4 * (n))       /* bit 31 valid, [30:16] mask, [14:0] stream */
 #define SMMU_S2CR(n)            (0xc00 + 4 * (n))       /* [17:16] 0 translate 1 bypass 2 fault, [7:0] context */
-#define RADIO_STREAM            0x1c00
+static uint32_t radio_stream = 0x1c00;
+#define RADIO_STREAM            radio_stream
 #define RADIO_STREAM_MASK       0x0001
 
 static void
@@ -3658,7 +3820,7 @@ smmu_look(void)
  */
 #define RADIO_ADDRESSES         0xa0000000ull
 #define RADIO_ADDRESSES_SIZE    0x10000000u
-#define RADIO_TABLES            32              /* of 4K: the root, one of the second level, and 2 MB of addresses each other */
+#define RADIO_TABLES            64              /* of 4K: the root, one of the second level, and 2 MB of addresses each other */
 #define RADIO_PTE               (3ull | 1ull << 6 | 2ull << 8 | 1ull << 10 | 1ull << 11) /* a page; for requests of either
 	                                                                                  * privilege; shared, accessed, not
 	                                                                                  * global: Linux's for a device */
@@ -3954,10 +4116,13 @@ radio_map(uint64_t physical, uint64_t size, uint64_t attributes, unsigned long l
 	}
 	printf("wifi: %u: the radio is to see %llu KB of ours (%#llx) at %#llx\n", step, size >> 10, physical, *address);
 	if (!radio_space.on) {
-		bool on = radio_space_on();
-
-		lck_mtx_unlock(&hakios_smmu_lock);
-		return on;
+		if (parrot_wifi) {
+			radio_enter(0x82a00000ull, 0x82a00000ull, 0x00300000ull, RADIO_PTE);
+		}
+		if (!radio_space_on()) {
+			lck_mtx_unlock(&hakios_smmu_lock);
+			return false;
+		}
 	}
 	lck_mtx_unlock(&hakios_smmu_lock);
 	put(&apps_smmu_context, "tlbiasid", SMMU_CB_TLBIASID, radio_space.context);
@@ -4036,13 +4201,36 @@ hakios_wifi_dsp_is_up(void)
 const uint8_t *
 hakios_wifi_driver_file(const char *name, uint64_t *size)
 {
-	static const char *const files[][2] = { { "board.bin", "bd_m20gl.elf" }, { "regdb.bin", "regdb_xiaomi.bin" } };
+	/* Synthetic 48-byte firmware-5.bin for WCN3990 SNOC: NON_BMI|SINGLE_CHAN_INFO|MGMT_TX_BY_REF|WOWLAN, WMI_TLV(4), HTT_TLV(3) */
+	static const uint8_t wcn3990_fw5[48] = {
+		'Q', 'C', 'A', '-', 'A', 'T', 'H', '1', '0', 'K', 0, 0,
+		/* IE 2: ATH10K_FW_IE_FEATURES (len 4): bits 6, 18, 19, 20 = 0x001c0040 */
+		2, 0, 0, 0, 4, 0, 0, 0, 0x40, 0x00, 0x1c, 0x00,
+		/* IE 5: ATH10K_FW_IE_WMI_OP_VERSION (len 4): ATH10K_FW_WMI_OP_VERSION_TLV = 4 */
+		5, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0,
+		/* IE 6: ATH10K_FW_IE_HTT_OP_VERSION (len 4): ATH10K_FW_HTT_OP_VERSION_TLV = 3 */
+		6, 0, 0, 0, 4, 0, 0, 0, 3, 0, 0, 0,
+	};
+	static const char *const files_redwood[][2] = { { "board.bin", "bd_m20gl.elf" }, { "regdb.bin", "regdb_xiaomi.bin" } };
+	static const char *const files_parrot[][2] = { { "board.bin", "bd17gpt.bin" }, { "regdb.bin", "regdb.bin" } };
 	const char *last = strrchr(name, '/');
 
 	last = last == NULL ? name : last + 1;
-	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
-		if (strcmp(last, files[i][0]) == 0) {
-			return image_file(files[i][1], size);
+	if (parrot_wifi && strcmp(last, "firmware-5.bin") == 0) {
+		*size = sizeof(wcn3990_fw5);
+		return wcn3990_fw5;
+	}
+	if (parrot_wifi) {
+		for (unsigned i = 0; i < sizeof(files_parrot) / sizeof(files_parrot[0]); i++) {
+			if (strcmp(last, files_parrot[i][0]) == 0) {
+				return image_file(files_parrot[i][1], size);
+			}
+		}
+		return NULL;
+	}
+	for (unsigned i = 0; i < sizeof(files_redwood) / sizeof(files_redwood[0]); i++) {
+		if (strcmp(last, files_redwood[i][0]) == 0) {
+			return image_file(files_redwood[i][1], size);
 		}
 	}
 	return NULL;
@@ -4064,6 +4252,12 @@ hakios_wifi_radio_address(uint8_t *address)
 	bool good;
 
 	if (!PE_parse_boot_arg_str("wifi_mac", text, sizeof(text)) || text[0] == 0) {
+		if (parrot_wifi) {
+			static const uint8_t parrot_mac[6] = { 0x2c, 0x0d, 0xcf, 0xec, 0xdd, 0x78 };
+			memcpy(address, parrot_mac, sizeof(parrot_mac));
+			printf("wifi: %u: the driver asks for the radio's address: using parrot DMS MAC\n", step);
+			return true;
+		}
 		printf("wifi: %u: the driver asks for the radio's address: none was given (wifi_mac)\n", step);
 		return false;
 	}
@@ -4313,9 +4507,26 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 void
 hakios_wifi_init(void)
 {
-	uint32_t on = 0, back = 0, done = 0;
+	uint32_t on = 0, back = 0, done = 0, val = 0;
 	uint64_t size = 0;
 	thread_t thread;
+
+	if (PE_parse_boot_argn("soc_ipcc", &val, sizeof(val)) && val != 0) {
+		ipcc.phys = val;
+		if (val == 0x0ed18000u) {
+			parrot_wifi = true;
+			wpss_memory = 0x85300000u;
+			wpss_memory_size = 0x01900000u;
+			radio_stream = 0x04c0u;
+			rsc.phys = 0x17a20000u;
+		}
+	}
+	if (PE_parse_boot_argn("soc_aoss", &val, sizeof(val)) && val != 0) {
+		aoss.phys = val;
+	}
+	if (PE_parse_boot_argn("soc_rsc", &val, sizeof(val)) && val != 0) {
+		rsc.phys = val;
+	}
 
 	PE_parse_boot_argn("wifi_step", &last_step, sizeof(last_step));
 	if (last_step == 0 && (!PE_parse_boot_argn("wifi", &on, sizeof(on)) || on == 0)) {

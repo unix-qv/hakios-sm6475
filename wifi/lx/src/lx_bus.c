@@ -24,6 +24,7 @@
  * "unified ready", with the copy engines looked at once a millisecond, and the scan hears the
  * networks around (drivers/wifi/hakios.wifi.c, step_driver(), has the account).
  */
+#ifndef LX_ATH10K
 #define LX_QMI_AS_IT_IS				/* (this file is where the driver's requests go past) */
 #include <linux/kernel.h>
 #include <linux/device.h>
@@ -861,3 +862,4 @@ lx_transmit(const unsigned char *frame, unsigned long length)
 {
 	return (driver != NULL ? lx_station_send(frame, length) : ENETDOWN);
 }
+#endif

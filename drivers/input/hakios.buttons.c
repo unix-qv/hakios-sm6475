@@ -95,10 +95,10 @@ wr(vm_offset_t address, uint32_t value)
 /* ---- the PMIC arbiter ---------------------------------------------------------------------------- */
 
 #define ARB_CORE_PHYS           0x0c400000UL    /* "core": the version, and which peripheral each channel is */
-#define ARB_CORE_SIZE           0x1100UL
+#define ARB_CORE_SIZE           0x10000UL
 #define ARB_CNFG_PHYS           0x0c42d000UL    /* "cnfg": which system owns each channel */
-#define ARB_CNFG_SIZE           0x1000UL
-#define ARB_OBSERVER_PHYS       0x0c440000UL    /* "obsrvr": 0x10000 per system, 0x80 per channel in it */
+#define ARB_CNFG_SIZE           0x4000UL
+#define ARB_OBSERVER_PHYS       0x0c440000UL    /* "obsrvr": 0x10000 per system, 0x80 (v5) / 0x20 (v7) per channel */
 #define ARB_OBSERVER_SIZE       0x10000UL       /* ours is the first */
 #define ARB_SYSTEM              0               /* who we are to the arbiter: the device tree's "qcom,ee" */
 
@@ -106,10 +106,10 @@ wr(vm_offset_t address, uint32_t value)
 #define ARB_VERSION_5           0x50000000u     /* what follows is version 5's; 7 moved things again */
 #define ARB_VERSION_7           0x70000000u
 #define ARB_FEATURES            0x004           /* [10:0] the number of channels */
-#define ARB_CHANNEL(n)          (0x900 + 4 * (n))       /* core: [19:8] slave and peripheral, [24] interrupts go to the owner */
+#define ARB_CHANNEL(n)          ((arb_v7 ? 0x2000u : 0x900u) + 4u * (n))
 #define ARB_CHANNEL_INTERRUPTS  (1u << 24)
-#define ARB_OWNER(n)            (0x700 + 4 * (n))       /* cnfg: [2:0] the system that may write through channel n */
-#define ARB_MAX_CHANNELS        512
+#define ARB_OWNER(n)            ((arb_v7 ? 0x000u : 0x700u) + 4u * (n))
+#define ARB_MAX_CHANNELS        1024
 
 #define OBSERVER_COMMAND        0x00
 #define OBSERVER_STATUS         0x08
@@ -123,6 +123,7 @@ wr(vm_offset_t address, uint32_t value)
 #define READ_TIMEOUT_US         2000            /* a read takes some tens of microseconds */
 
 static vm_offset_t arb_core, arb_cnfg, arb_observer;
+static bool arb_v7;
 
 /* one transfer at a time through the arbiter: hakios_spmi_lock() (drivers/core/hakios.platform.c) */
 
@@ -147,7 +148,7 @@ static struct {
 static const char *
 spmi_read(const struct peripheral *p, uint8_t reg, uint8_t *bytes, uint32_t count)
 {
-	vm_offset_t channel = arb_observer + 0x10000UL * ARB_SYSTEM + 0x80UL * p->channel;
+	vm_offset_t channel = arb_observer + 0x10000UL * ARB_SYSTEM + (arb_v7 ? 0x20UL : 0x80UL) * p->channel;
 	uint64_t start = mach_absolute_time(), now, interval, taken;
 	uint32_t status, data[2];
 	const char *problem = NULL;
@@ -442,10 +443,11 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
 	arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
 	version = rd(arb_core + ARB_VERSION);
+	arb_v7 = version >= ARB_VERSION_7;
 	channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
-	printf("buttons: PMIC arbiter version %#x, %u channels\n", version, channels);
-	if (version < ARB_VERSION_5 || version >= ARB_VERSION_7) {
-		printf("buttons: this driver knows version 5 of the arbiter only: no buttons\n");
+	printf("buttons: PMIC arbiter version %#x (%s), %u channels\n", version, arb_v7 ? "v7" : "v5", channels);
+	if (version < ARB_VERSION_5) {
+		printf("buttons: unsupported arbiter version: no buttons\n");
 		goto out;
 	}
 	if (channels == 0 || channels > ARB_MAX_CHANNELS) {

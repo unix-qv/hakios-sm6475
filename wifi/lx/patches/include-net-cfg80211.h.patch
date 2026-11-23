@@ -37,3 +37,13 @@
  }
  
  static __inline int
+@@ -1768,7 +1760,8 @@
+ wiphy_apply_custom_regulatory(struct wiphy *wiphy,
+     const struct linuxkpi_ieee80211_regdomain *regd)
+ {
+-	TODO();
++	linuxkpi_regulatory_set_wiphy_regd_sync(wiphy,
++	    (struct linuxkpi_ieee80211_regdomain *)(uintptr_t)regd);
+ }
+ 
+ static __inline char *

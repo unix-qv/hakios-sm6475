@@ -130,6 +130,23 @@ void hakios_adsp_apr_events_second(hakios_apr_events_t handler);
 bool hakios_audio_recording_mic(void);
 void hakios_mic_dsp_up(void);          /* the DSP's audio services are up (adsp=1): boot-arg mic=N begins */
 void hakios_mic_dsp_down(void);        /* before the DSP is shut down at the run's end: what the microphones' path asked for given back */
+
+struct hakios_gpr_answer {
+	uint32_t src_port, dest_port, token, opcode, length;
+	uint32_t words[64];
+};
+typedef bool (*hakios_gpr_events_t)(uint32_t src_port, uint32_t dest_port, uint32_t opcode, uint32_t token,
+    const uint32_t *payload, uint32_t length);
+
+bool hakios_adsp_gpr(uint32_t src_port, uint32_t dest_port, uint32_t token, uint32_t opcode, const void *payload,
+    uint32_t length, uint32_t wait_ms, struct hakios_gpr_answer *answer);
+void hakios_adsp_gpr_events(hakios_gpr_events_t handler);
+void hakios_adsp_gpr_events_second(hakios_gpr_events_t handler);
+bool hakios_adsp_is_gpr(void);
+
+void hakios_parrot_audio_dsp_up(void);
+void hakios_parrot_audio_dsp_down(void);
+void hakios_parrot_audio_quiesce(void);
 #endif
 
 #endif /* _SYS_HAKIOS_AUDIO_H_ */

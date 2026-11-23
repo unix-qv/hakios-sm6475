@@ -556,6 +556,140 @@ buf[0x4c7174:0x4c7178] = struct.pack("<I", 0xd1400908)
 assert struct.unpack("<I", buf[0x4c7fe0:0x4c7fe4])[0] == 0xb949014a
 buf[0x4c7fe0:0x4c7fe4] = struct.pack("<I", 0xb960014a)
 
+# 12. PM6150L Flashlight (Torch) hardware register fix:
+# 1. _put whitelist bypass: cbz w10, ... -> nop (VA 0xfffffff0074cbfa4)
+assert struct.unpack("<I", buf[0x4c7fa4:0x4c7fa8])[0] == 0x34000a8a
+buf[0x4c7fa4:0x4c7fa8] = struct.pack("<I", 0xd503201f)
+
+# 2. Compile and install parrot_torch_light directly at _light entry (0x4c74e4, VA 0xfffffff0074cb4e4)
+light_asm = """
+.global _start
+.text
+_start:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    stp x19, x20, [sp, #16]
+
+    // permille in w0 (0 to 1000)
+    mov w1, #23
+    mul w0, w0, w1
+    add w0, w0, #500
+    mov w1, #1000
+    udiv w19, w0, w1
+    mov w2, #23
+    cmp w19, #23
+    csel w19, w19, w2, ls
+    cmp w19, #0
+    csinc w19, w19, wzr, ne
+
+    // 1. Safety timer ch0: 0x40 <- 0x13
+    mov w0, #0x40
+    mov w1, #0x13
+    bl put_func
+
+    // 2. Safety timer ch1: 0x41 <- 0x13
+    mov w0, #0x41
+    mov w1, #0x13
+    bl put_func
+
+    // 3. Target current ch0: 0x43 <- code
+    mov w0, #0x43
+    mov w1, w19
+    bl put_func
+
+    // 4. Target current ch1: 0x44 <- code
+    mov w0, #0x44
+    mov w1, w19
+    bl put_func
+
+    // 5. Module enable: 0x46 <- 0x80
+    mov w0, #0x46
+    mov w1, #0x80
+    bl put_func
+
+    // 6. Channel enable: 0x4c <- 0x03
+    mov w0, #0x4c
+    mov w1, #0x03
+    bl put_func
+
+    adrp x20, lit_var
+    mov w0, #1
+    strb w0, [x20, :lo12:lit_var]
+
+    mov w0, #1
+    ldp x19, x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+"""
+with open("/tmp/parrot_light.s", "w") as f: f.write(light_asm)
+subprocess.check_call(["llvm-mc", "-arch=aarch64", "-filetype=obj", "/tmp/parrot_light.s", "-o", "/tmp/parrot_light.o"])
+subprocess.check_call(["ld.lld", "-Ttext=0xfffffff0074cb4e4", "--defsym=put_func=0xfffffff0074cbf44", "--defsym=lit_var=0xfffffff007ef3285", "/tmp/parrot_light.o", "-o", "/tmp/parrot_light.elf"])
+subprocess.check_call(["llvm-objcopy", "-O", "binary", "/tmp/parrot_light.elf", "/tmp/parrot_light.bin"])
+with open("/tmp/parrot_light.bin", "rb") as f: parrot_light_bin = f.read()
+buf[0x4c74e4:0x4c74e4+len(parrot_light_bin)] = parrot_light_bin
+print("parrot_light installed at 0x4c74e4, size:", len(parrot_light_bin))
+
+# 3. Compile and install parrot_torch_dark directly at _dark entry (0x4c6d28, VA 0xfffffff0074cad28)
+dark_asm = """
+.global _start
+.text
+_start:
+    stp x29, x30, [sp, #-32]!
+    mov x29, sp
+    str x20, [sp, #16]
+
+    // 1. Channel disable: 0x4c <- 0x00
+    mov w0, #0x4c
+    mov w1, #0x00
+    bl put_func
+
+    // 2. Module disable: 0x46 <- 0x00
+    mov w0, #0x46
+    mov w1, #0x00
+    bl put_func
+
+    // 3. Target current ch0: 0x43 <- 0x00
+    mov w0, #0x43
+    mov w1, #0x00
+    bl put_func
+
+    // 4. Target current ch1: 0x44 <- 0x00
+    mov w0, #0x44
+    mov w1, #0x00
+    bl put_func
+
+    // 5. Safety timer ch0: 0x40 <- 0x93
+    mov w0, #0x40
+    mov w1, #0x93
+    bl put_func
+
+    // 6. Safety timer ch1: 0x41 <- 0x93
+    mov w0, #0x41
+    mov w1, #0x93
+    bl put_func
+
+    adrp x20, lit_var
+    strb wzr, [x20, :lo12:lit_var]
+
+    mov w0, #1
+    ldr x20, [sp, #16]
+    ldp x29, x30, [sp], #32
+    ret
+"""
+with open("/tmp/parrot_dark.s", "w") as f: f.write(dark_asm)
+subprocess.check_call(["llvm-mc", "-arch=aarch64", "-filetype=obj", "/tmp/parrot_dark.s", "-o", "/tmp/parrot_dark.o"])
+subprocess.check_call(["ld.lld", "-Ttext=0xfffffff0074cad28", "--defsym=put_func=0xfffffff0074cbf44", "--defsym=lit_var=0xfffffff007ef3285", "/tmp/parrot_dark.o", "-o", "/tmp/parrot_dark.elf"])
+subprocess.check_call(["llvm-objcopy", "-O", "binary", "/tmp/parrot_dark.elf", "/tmp/parrot_dark.bin"])
+with open("/tmp/parrot_dark.bin", "rb") as f: parrot_dark_bin = f.read()
+buf[0x4c6d28:0x4c6d28+len(parrot_dark_bin)] = parrot_dark_bin
+print("parrot_dark installed at 0x4c6d28, size:", len(parrot_dark_bin))
+
+# 4. hakios_torch_quiesce: 0x4e -> 0x4c, 0x42 -> 0x43
+assert struct.unpack("<I", buf[0x4c6bcc:0x4c6bd0])[0] == 0x528009c1
+buf[0x4c6bcc:0x4c6bd0] = struct.pack("<I", 0x52800981)
+assert struct.unpack("<I", buf[0x4c6be0:0x4c6be4])[0] == 0x52800841
+buf[0x4c6be0:0x4c6be4] = struct.pack("<I", 0x52800861)
+
 # Write directly to hakios-kernel (and parrot copy)
 with open("/home/uralredux/Документы/project/hakios/hakios-kernel", "wb") as f:
     f.write(buf)

@@ -58,6 +58,24 @@ of_property_read_u32(const struct device_node *np, const char *name, u32 *out)
 	return (of_property_read_u32_index(np, name, 0, out));
 }
 
+static inline int
+of_property_read_u8_array(const struct device_node *np, const char *name, u8 *out, size_t sz)
+{
+	return (-EINVAL);
+}
+
+static inline int
+of_property_read_u8(const struct device_node *np, const char *name, u8 *out)
+{
+	return (-EINVAL);
+}
+
+static inline int
+of_property_read_string_index(const struct device_node *np, const char *name, int index, const char **out)
+{
+	return (-EINVAL);
+}
+
 static inline bool
 of_property_present(const struct device_node *np, const char *name)
 {

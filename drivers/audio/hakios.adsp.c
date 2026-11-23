@@ -983,8 +983,8 @@ step_survey(void)
 
 /* ---- step 2: the firmware -------------------------------------------------------------------------- */
 
-#define ADSP_MEMORY             0x86700000u     /* dt: reserved-memory adsp@86700000, memory-region of qcom,lpass@3700000 */
-#define ADSP_MEMORY_SIZE        0x04000000u
+static uint32_t adsp_memory = 0x86700000u;      /* dt: reserved-memory adsp@..., overridden by soc_adsp_mem */
+static uint32_t adsp_memory_size = 0x04000000u; /* overridden by soc_adsp_size */
 #define PAS_ADSP                1               /* dt: qcom,pas-id */
 
 
@@ -1014,7 +1014,7 @@ root_file(const char *name, uint64_t *size)
 	VATTR_INIT(&attributes);
 	VATTR_WANTED(&attributes, va_data_size);
 	if (vnode_getattr(vnode, &attributes, context) != 0 || attributes.va_data_size == 0 ||
-	    attributes.va_data_size > ADSP_MEMORY_SIZE) {
+	    attributes.va_data_size > adsp_memory_size) {
 		vnode_put(vnode);
 		return NULL;
 	}
@@ -1148,8 +1148,6 @@ step_firmware(void)
 		goto fail;
 	}
 	for (uint32_t i = 0; i < count; i++) {
-		char name[16];
-
 		memcpy(&segment, header + 52 + 32 * i, sizeof(segment));
 		if (MDT_HASH(segment.flags)) {
 			hashes = segment.file_size;
@@ -1157,13 +1155,27 @@ step_firmware(void)
 		if (segment.type != 1 || MDT_HASH(segment.flags) || segment.memory_size == 0) {
 			continue;
 		}
-		if (segment.paddr < ADSP_MEMORY || segment.file_size > segment.memory_size ||
-		    (uint64_t)segment.paddr + segment.memory_size > (uint64_t)ADSP_MEMORY + ADSP_MEMORY_SIZE) {
-			printf("adsp: %u: segment %u (%#x, %#x bytes) is not within the DSP's memory\n", step, i, segment.paddr,
+		if (segment.file_size > segment.memory_size) {
+			printf("adsp: %u: segment %u (%#x, %#x bytes) file larger than memory\n", step, i, segment.paddr,
 			    segment.memory_size);
 			goto fail;
 		}
-		image.segment[image.segments].at = segment.paddr - ADSP_MEMORY;
+		lowest = segment.paddr < lowest ? segment.paddr : lowest;
+		highest = segment.paddr + segment.memory_size > highest ? segment.paddr + segment.memory_size : highest;
+	}
+	if (lowest >= highest || (uint64_t)(highest - lowest) > adsp_memory_size) {
+		printf("adsp: %u: image span %#x..%#x does not fit in %#x bytes at %#x\n", step, lowest, highest, adsp_memory_size,
+		    adsp_memory);
+		goto fail;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		char name[16];
+
+		memcpy(&segment, header + 52 + 32 * i, sizeof(segment));
+		if (segment.type != 1 || MDT_HASH(segment.flags) || segment.memory_size == 0) {
+			continue;
+		}
+		image.segment[image.segments].at = segment.paddr - lowest;
 		image.segment[image.segments].file_size = segment.file_size;
 		image.segment[image.segments].memory_size = segment.memory_size;
 		image.segment[image.segments].file = NULL;
@@ -1184,21 +1196,19 @@ step_firmware(void)
 			}
 			files += file_size;
 		}
-		lowest = segment.paddr < lowest ? segment.paddr : lowest;
-		highest = segment.paddr + segment.memory_size > highest ? segment.paddr + segment.memory_size : highest;
 		image.segments++;
 	}
-	if (image.segments == 0 || lowest != ADSP_MEMORY || 52 + 32 * count + (uint64_t)hashes != size) {
+	if (image.segments == 0 || 52 + 32 * count + (uint64_t)hashes != size) {
 		printf("adsp: %u: not what TrustZone takes: %u segments to load, the lowest at %#x; the header file has %llu bytes, "
 		    "the header %u and the hashes %u\n", step, image.segments, lowest, size, 52 + 32 * count, hashes);
 		goto fail;
 	}
 	image.header = header;
 	image.header_size = size;
-	image.size = ((highest + 0xfff) & ~0xfffu) - ADSP_MEMORY;
+	image.size = ((highest - lowest) + 0xfffu) & ~0xfffu;
 	printf("adsp: %u: the image is whole (%s): a header of %llu bytes (%u of hashes), %u segments, %llu bytes of files, %#x "
-	    "bytes of the DSP's %#x from %#x\n", step, from_root ? "from /fw on the root" : "from the small image", size, hashes,
-	    image.segments, files, image.size, ADSP_MEMORY_SIZE, ADSP_MEMORY);
+	    "bytes of the DSP's %#x from %#x (elf base %#x)\n", step, from_root ? "from /fw on the root" : "from the small image",
+	    size, hashes, image.segments, files, image.size, adsp_memory_size, adsp_memory, lowest);
 	return true;
 fail:
 	image_forget();
@@ -1446,12 +1456,12 @@ step_header(void)
 	printf("adsp: %u: TRUSTZONE ACCEPTS THE AUDIO DSP'S SIGNATURE FROM THIS KERNEL\n", step);
 
 	announce("tell TrustZone where the image will be");
-	result = scm("where the image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_ADSP, ADSP_MEMORY, image.size, &answer);
+	result = scm("where the image will be", SCM_PAS_MEM_SETUP, SCM_THREE_VALUES, PAS_ADSP, adsp_memory, image.size, &answer);
 	if (result != 0 || answer != 0) {
 		printf("adsp: %u: TRUSTZONE DOES NOT TAKE THE PLACE: the call returns %d, its answer is %#llx\n", step, result, answer);
 		return false;
 	}
-	printf("adsp: %u: TrustZone takes the place: %#x bytes at %#x\n", step, image.size, ADSP_MEMORY);
+	printf("adsp: %u: TrustZone takes the place: %#x bytes at %#x\n", step, image.size, adsp_memory);
 	return true;
 }
 
@@ -1479,16 +1489,16 @@ step_image(void)
 	if (image.segments == 0) {
 		return false;
 	}
-	announce("put the image's segments into the audio DSP's memory (0x86700000, 64 MB: memory of nobody's until TrustZone "
-	    "starts the DSP), with zeroes where a segment is longer than its file, and read them back");
-	dsp_memory = (volatile uint64_t *)ml_io_map_unmappable(ADSP_MEMORY, ADSP_MEMORY_SIZE, VM_WIMG_WCOMB);
-	snprintf(last_write, sizeof(last_write), "step %u wrote the image at %#x", step, ADSP_MEMORY);
+	announce("put the image's segments into the audio DSP's memory, with zeroes where a segment is longer than its file, "
+	    "and read them back");
+	dsp_memory = (volatile uint64_t *)ml_io_map_unmappable(adsp_memory, adsp_memory_size, VM_WIMG_WCOMB);
+	snprintf(last_write, sizeof(last_write), "step %u wrote the image at %#x", step, adsp_memory);
 	for (unsigned s = 0; s < image.segments; s++) {
 		volatile uint64_t *to = dsp_memory + image.segment[s].at / 8;
 
 		if ((image.segment[s].at | image.segment[s].memory_size) & 7) {
 			printf("adsp: %u: a segment that does not begin and end at a multiple of eight bytes: not written\n", step);
-			ml_io_unmap((vm_offset_t)dsp_memory, ADSP_MEMORY_SIZE);
+			ml_io_unmap((vm_offset_t)dsp_memory, adsp_memory_size);
 			return false;
 		}
 		for (uint32_t i = 0; i < image.segment[s].memory_size; i += 8) {
@@ -1508,7 +1518,7 @@ step_image(void)
 	printf("adsp: %u: %u segments, %llu bytes written and %llu cleared; read back, %llu words of eight bytes differ\n", step,
 	    image.segments, written, cleared, wrong);
 	settle();
-	ml_io_unmap((vm_offset_t)dsp_memory, ADSP_MEMORY_SIZE);
+	ml_io_unmap((vm_offset_t)dsp_memory, adsp_memory_size);
 	image_written = wrong == 0;
 	image_forget();                         /* (it is in the DSP's memory now: what was read of the root, given back) */
 	return image_written;
@@ -1825,7 +1835,7 @@ struct glink_packet {
  * carries APR, the audio services' own protocol (below; Android's apr_tal_rpmsg.c asks for no
  * particular intents: what the DSP sends there is a few hundred bytes, up to a few kilobytes).
  */
-enum { CHANNEL_QRTR, CHANNEL_APR, CHANNEL_PMIC, CHANNELS };
+enum { CHANNEL_QRTR, CHANNEL_APR, CHANNEL_PMIC, CHANNEL_GPR, CHANNELS };
 
 struct glink_channel {
 	const char *name;
@@ -1863,6 +1873,8 @@ static struct {
 		[CHANNEL_APR] = { .name = "apr_audio_svc", .ours = 2, .intents = { { 0x200, 8 }, { 0x1000, 4 }, { 0x2000, 2 } } },
 		/* the battery manager's (battmgr below): answers of a few dozen bytes, a name of 128 */
 		[CHANNEL_PMIC] = { .name = "PMIC_RTR_ADSP_APPS", .ours = 3, .intents = { { 0x200, 6 }, { 0x1000, 2 }, { 0, 0 } } },
+		/* AudioReach GPR channel on newer Qualcomm SoCs (e.g. SM6475 / parrot) */
+		[CHANNEL_GPR] = { .name = "adsp_apps", .ours = 4, .intents = { { 0x200, 14 }, { 0x1000, 4 }, { 0x2000, 2 } } },
 	},
 };
 
@@ -2701,7 +2713,7 @@ apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, 
 #define USB_CURR_NOW            3               /* uA, what the port gives */
 #define USB_TYPE                6               /* Linux's POWER_SUPPLY_USB_TYPE_*: 1 here, a computer's port */
 #define USB_ONLINE              0
-#define BATTMGR_SECONDS         10
+#define BATTMGR_SECONDS         2
 
 struct battmgr_message {
 	uint32_t owner, type, opcode;
@@ -2893,6 +2905,201 @@ battmgr_stop(void)
 
 static volatile bool link_wanted, link_runs;
 
+/* ---- GPR (AudioReach / SPF on adsp_apps channel) --------------------------------------------------- */
+
+#define GPR_DOMAIN_ADSP                 2u
+#define GPR_DOMAIN_APPS                 3u
+#define GPR_PORT_APM                    0x00000001u
+#define GPR_PORT_PRM                    0x00000002u
+#define GPR_PORT_CLIENT                 0x00002000u
+#define GPR_APM_CMD_GET_SPF_STATE       0x01001021u
+#define GPR_APM_CMD_RSP_GET_SPF_STATE   0x02001007u
+#define GPR_IBASIC_RSP_RESULT           0x02001005u
+
+struct gpr_hdr {
+	uint32_t header;        /* [3:0] version=0, [7:4] hdr_size=6 (words), [31:8] pkt_size (bytes) */
+	uint32_t domains;       /* [7:0] dest_domain, [15:8] src_domain */
+	uint32_t src_port;
+	uint32_t dest_port;
+	uint32_t token;
+	uint32_t opcode;
+};
+
+static LCK_MTX_DECLARE(gpr_lock, &adsp_lock_group);
+static struct {
+	bool waiting, answered;
+	uint32_t src_port, dest_port, token, opcode, length;
+	uint32_t words[64];
+} gpr_answer;
+static uint32_t gpr_in, gpr_out, gpr_next_token = 1;
+static hakios_gpr_events_t gpr_events, gpr_events_second;
+
+static void
+gpr_input(const uint8_t *data, uint32_t length)
+{
+	struct gpr_hdr h;
+	uint32_t payload_len;
+	bool matched = false;
+	hakios_gpr_events_t h1, h2;
+
+	gpr_in++;
+	if (length < sizeof(h)) {
+		return;
+	}
+	memcpy(&h, data, sizeof(h));
+	payload_len = length - (uint32_t)sizeof(h);
+	if (gpr_in <= 24) {
+		uint32_t w0 = payload_len >= 4 ? (uint32_t)(data[24] | data[25] << 8 | data[26] << 16 | data[27] << 24) : 0;
+		printf("adsp: gpr: < src %#x dst %#x tok %#x op %#x (%u bytes, w0=%#x)\n",
+		    h.src_port, h.dest_port, h.token, h.opcode, payload_len, w0);
+	}
+	lck_mtx_lock(&gpr_lock);
+	if (gpr_answer.waiting && h.token == gpr_answer.token) {
+		gpr_answer.src_port = h.src_port;
+		gpr_answer.dest_port = h.dest_port;
+		gpr_answer.opcode = h.opcode;
+		gpr_answer.length = payload_len < sizeof(gpr_answer.words) ? payload_len : (uint32_t)sizeof(gpr_answer.words);
+		bzero(gpr_answer.words, sizeof(gpr_answer.words));
+		if (gpr_answer.length > 0) {
+			memcpy(gpr_answer.words, data + sizeof(h), gpr_answer.length);
+		}
+		gpr_answer.answered = true;
+		matched = true;
+	}
+	h1 = gpr_events;
+	h2 = gpr_events_second;
+	lck_mtx_unlock(&gpr_lock);
+
+	if (!matched && (h1 != NULL || h2 != NULL)) {
+		uint32_t words[64];
+		uint32_t copy = payload_len < sizeof(words) ? payload_len : (uint32_t)sizeof(words);
+		bzero(words, sizeof(words));
+		if (copy > 0) {
+			memcpy(words, data + sizeof(h), copy);
+		}
+		if (h1 == NULL || !h1(h.src_port, h.dest_port, h.opcode, h.token, words, payload_len)) {
+			if (h2 != NULL) {
+				(void)h2(h.src_port, h.dest_port, h.opcode, h.token, words, payload_len);
+			}
+		}
+	}
+}
+
+bool
+hakios_adsp_is_gpr(void)
+{
+	return glink.channel[CHANNEL_GPR].open;
+}
+
+void
+hakios_adsp_gpr_events(hakios_gpr_events_t handler)
+{
+	lck_mtx_lock(&gpr_lock);
+	gpr_events = handler;
+	lck_mtx_unlock(&gpr_lock);
+}
+
+void
+hakios_adsp_gpr_events_second(hakios_gpr_events_t handler)
+{
+	lck_mtx_lock(&gpr_lock);
+	gpr_events_second = handler;
+	lck_mtx_unlock(&gpr_lock);
+}
+
+bool
+hakios_adsp_gpr(uint32_t src_port, uint32_t dest_port, uint32_t token, uint32_t opcode, const void *payload,
+    uint32_t length, uint32_t wait_ms, struct hakios_gpr_answer *answer)
+{
+	struct gpr_hdr h;
+	uint32_t total = (uint32_t)sizeof(h) + length;
+	uint8_t stack_buf[sizeof(struct gpr_hdr) + 256];
+	uint8_t *buf = stack_buf;
+	uint64_t began;
+	bool got = false;
+	uint32_t tok;
+
+	if (!glink.channel[CHANNEL_GPR].open || length > 1920) {
+		return false;
+	}
+	if (total > sizeof(stack_buf)) {
+		buf = kalloc_data(total, Z_WAITOK);
+		if (buf == NULL) {
+			return false;
+		}
+	}
+	lck_mtx_lock(&gpr_lock);
+	if (token == 0) {
+		tok = gpr_next_token++;
+		if (gpr_next_token >= 0x01000000u) {
+			gpr_next_token = 1;
+		}
+	} else {
+		tok = token;
+	}
+	if (wait_ms > 0) {
+		bzero(&gpr_answer, sizeof(gpr_answer));
+		gpr_answer.waiting = true;
+		gpr_answer.token = tok;
+	}
+	lck_mtx_unlock(&gpr_lock);
+
+	h.header = (6u << 4) | ((total & 0xffffffu) << 8);
+	h.domains = GPR_DOMAIN_ADSP | (GPR_DOMAIN_APPS << 8);
+	h.src_port = src_port != 0 ? src_port : GPR_PORT_CLIENT;
+	h.dest_port = dest_port;
+	h.token = tok;
+	h.opcode = opcode;
+	memcpy(buf, &h, sizeof(h));
+	if (length > 0 && payload != NULL) {
+		memcpy(buf + sizeof(h), payload, length);
+	}
+	int sent = glink_send(&glink.channel[CHANNEL_GPR], buf, total);
+	if (buf != stack_buf) {
+		kfree_data(buf, total);
+	}
+	if (sent != 0) {
+		if (wait_ms > 0) {
+			lck_mtx_lock(&gpr_lock);
+			gpr_answer.waiting = false;
+			lck_mtx_unlock(&gpr_lock);
+		}
+		return false;
+	}
+	gpr_out++;
+	if (wait_ms == 0) {
+		return true;
+	}
+	began = now_us();
+	while (now_us() - began < wait_ms * 1000ull) {
+		lck_mtx_lock(&gpr_lock);
+		got = gpr_answer.answered;
+		if (got && answer != NULL) {
+			answer->src_port = gpr_answer.src_port;
+			answer->dest_port = gpr_answer.dest_port;
+			answer->token = gpr_answer.token;
+			answer->opcode = gpr_answer.opcode;
+			answer->length = gpr_answer.length;
+			memcpy(answer->words, gpr_answer.words, sizeof(answer->words));
+		}
+		lck_mtx_unlock(&gpr_lock);
+		if (got) {
+			break;
+		}
+		sleep_ms(2);
+	}
+	lck_mtx_lock(&gpr_lock);
+	gpr_answer.waiting = false;
+	lck_mtx_unlock(&gpr_lock);
+	return got;
+}
+
+static bool
+gpr_ask(uint32_t dest_port, uint32_t opcode, const void *payload, uint32_t payload_len, uint32_t wait_ms)
+{
+	return hakios_adsp_gpr(GPR_PORT_CLIENT, dest_port, 0, opcode, payload, payload_len, wait_ms, NULL);
+}
+
 static void
 link_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -2937,6 +3144,8 @@ link_thread(__unused void *parameter, __unused wait_result_t result)
 				qrtr_input(packet->data, packet->length);
 			} else if (from == CHANNEL_PMIC) {
 				battmgr_input(packet->data, packet->length);
+			} else if (from == CHANNEL_GPR) {
+				gpr_input(packet->data, packet->length);
 			} else {
 				apr_input(packet->data, packet->length);
 			}
@@ -3073,10 +3282,11 @@ step_link(void)
 		sleep_ms(1);
 	}
 	sleep_ms(50);
-	printf("adsp: %u: %llu ms after our version: versions %s (features %#x); the channel \"IPCRTR\" is %s, \"apr_audio_svc\" %s; "
+	printf("adsp: %u: %llu ms after our version: versions %s (features %#x); \"IPCRTR\" %s, \"apr_audio_svc\" %s, \"adsp_apps\" %s; "
 	    "the DSP also opened \"%s\" \"%s\" \"%s\" \"%s\"\n", step, (now_us() - began) / 1000, glink.agreed ? "agreed" :
 	    "NOT AGREED", glink.features, glink.channel[CHANNEL_QRTR].open ? "OPEN" : "NOT OPEN",
-	    glink.channel[CHANNEL_APR].open ? "OPEN" : "NOT OPEN", glink.others[0], glink.others[1], glink.others[2], glink.others[3]);
+	    glink.channel[CHANNEL_APR].open ? "OPEN" : "NOT OPEN", glink.channel[CHANNEL_GPR].open ? "OPEN" : "NOT OPEN",
+	    glink.others[0], glink.others[1], glink.others[2], glink.others[3]);
 	return glink.channel[CHANNEL_QRTR].open;
 }
 
@@ -3104,7 +3314,7 @@ step_qrtr(void)
 	return qrtr_hellos != 0;
 }
 
-/* ---- step 11: APR ---------------------------------------------------------------------------------- */
+/* ---- step 11: APR / GPR (AudioReach) ---------------------------------------------------------------- */
 
 static bool
 step_apr(void)
@@ -3113,13 +3323,31 @@ step_apr(void)
 	uint64_t began = now_us();
 
 	PE_parse_boot_argn("adsp_apr_wait", &wait_seconds, sizeof(wait_seconds));
-	announce("ask the audio DSP's core service over APR whether the audio services are up (again and again, as Android "
-	    "does), then which services it has");
-	for (unsigned ms = 0; ms < 3000 && !glink.channel[CHANNEL_APR].open; ms++) {
+	announce("ask the audio DSP's core service over APR or GPR (adsp_apps) whether the audio services are up");
+	for (unsigned ms = 0; ms < 3000 && !glink.channel[CHANNEL_APR].open && !glink.channel[CHANNEL_GPR].open; ms++) {
 		sleep_ms(1);
 	}
+	if (glink.channel[CHANNEL_GPR].open && !glink.channel[CHANNEL_APR].open) {
+		printf("adsp: %u: AudioReach GPR channel \"adsp_apps\" is open; querying APM SPF state\n", step);
+		while (now_us() - began < wait_seconds * 1000000ull) {
+			asked++;
+			if (gpr_ask(GPR_PORT_APM, GPR_APM_CMD_GET_SPF_STATE, NULL, 0, 500) &&
+			    gpr_answer.opcode == GPR_APM_CMD_RSP_GET_SPF_STATE) {
+				state = gpr_answer.words[0];
+				if (state == 1) {
+					break;
+				}
+			}
+			sleep_ms(200);
+		}
+		audio_up = state == 1;
+		printf("adsp: %u: %s (GPR/SPF) after %llu ms and %u questions (last answer: op %#x, %u bytes, status %#x)\n", step,
+		    state == 1 ? "THE AUDIO SERVICES ARE UP" : "THE AUDIO SERVICES DO NOT SAY THEY ARE UP",
+		    (now_us() - began) / 1000, asked, gpr_answer.opcode, gpr_answer.length, gpr_answer.words[0]);
+		return state == 1;
+	}
 	if (!glink.channel[CHANNEL_APR].open) {
-		printf("adsp: %u: the channel \"apr_audio_svc\" is not open: the DSP has not opened it\n", step);
+		printf("adsp: %u: neither \"apr_audio_svc\" nor \"adsp_apps\" is open\n", step);
 		return false;
 	}
 	while (now_us() - began < wait_seconds * 1000000ull) {
@@ -3178,6 +3406,7 @@ void
 hakios_adsp_stop(void)
 {
 	battmgr_stop();
+	hakios_parrot_audio_dsp_down();
 	hakios_sound_dsp_down();               /* the amplifiers, the stream and the port first, while the DSP still listens */
 	hakios_mic_dsp_down();                 /* and what the microphones' path has asked for */
 	lck_mtx_lock(&dsp_lock);
@@ -3202,6 +3431,7 @@ hakios_adsp_stop(void)
 void
 hakios_adsp_quiesce(void)
 {
+	hakios_parrot_audio_quiesce();
 	hakios_sound_quiesce();                /* the amplifiers off, whatever the DSP's state */
 	if (!dsp_started) {
 		return;
@@ -3226,6 +3456,10 @@ run_steps(void)
 	}
 	step = done;
 	new_from = STEPS + 1;
+	if (done == STEPS && audio_up && !keep && option("parrot_audio")) {
+		hakios_parrot_audio_dsp_up();
+		hakios_parrot_audio_dsp_down();
+	}
 	steps_over(done);
 	printf("adsp: over after step %u; %s\n", done, last_write);
 }
@@ -3245,8 +3479,10 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 		services += qrtr_servers[i].there;
 	}
 	if (step == STEPS && dsp_started) {
-		tell("adsp: THE AUDIO DSP IS UP AND LINKED, its audio services up (APR), %llu ms after the kernel began on it (the "
-		    "root's waited for included): node %u, %u services; it stays on\n", (now_us() - began) / 1000, qrtr_peer, services);
+		tell("adsp: THE AUDIO DSP IS UP AND LINKED, its audio services up (%s), %llu ms after the kernel began on it (the "
+		    "root's waited for included): node %u, %u services; it stays on\n",
+		    glink.channel[CHANNEL_GPR].open ? "GPR" : "APR", (now_us() - began) / 1000, qrtr_peer, services);
+		hakios_parrot_audio_dsp_up();
 		hakios_sound_dsp_up();         /* (boot-arg sound=N: the speakers' path, hakios.sound.c) */
 		hakios_mic_dsp_up();           /* (boot-arg mic=N: the microphones' path, hakios.mic.c) */
 		battmgr_start();                /* (how the battery is, from the DSP; battmgr=0: not asked) */
@@ -3261,8 +3497,28 @@ whole_thread(__unused void *parameter, __unused wait_result_t result)
 void
 hakios_adsp_init(void)
 {
-	uint32_t on = 0;
+	uint32_t on = 0, val = 0;
 	thread_t thread;
+
+	if (PE_parse_boot_argn("soc_ipcc", &val, sizeof(val)) && val != 0) {
+		ipcc.phys = val;
+		if (val == 0x0ed18000u) {
+			adsp_memory = 0x86c00000u;
+			adsp_memory_size = 0x02800000u;
+		}
+	}
+	if (PE_parse_boot_argn("soc_aoss", &val, sizeof(val)) && val != 0) {
+		aoss.phys = val;
+	}
+	if (PE_parse_boot_argn("soc_rsc", &val, sizeof(val)) && val != 0) {
+		rsc.phys = val;
+	}
+	if (PE_parse_boot_argn("soc_adsp_mem", &val, sizeof(val)) && val != 0) {
+		adsp_memory = val;
+	}
+	if (PE_parse_boot_argn("soc_adsp_size", &val, sizeof(val)) && val != 0) {
+		adsp_memory_size = val;
+	}
 
 	PE_parse_boot_argn("adsp_step", &last_step, sizeof(last_step));
 	if (last_step == 0 && (!PE_parse_boot_argn("adsp", &on, sizeof(on)) || on != 1)) {
@@ -3276,7 +3532,7 @@ hakios_adsp_init(void)
 		/* all of it, on a thread of its own, and left up */
 		last_step = STEPS;
 		keep = true;
-		quiet = true;
+		quiet = !option("adsp_verbose");
 		pause_ms = 0;
 		listen_seconds = 1;
 		new_from = STEPS + 1;

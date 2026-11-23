@@ -47,7 +47,11 @@ extern kern_return_t thread_terminate(thread_t thread);
 extern lck_mtx_t hakios_rsc_lock;
 
 static vm_offset_t tlmm, gcc, se, rsc, cmd_db;
+#ifdef HAKIOS_PARROT_AUDIO
+static uint32_t is_parrot = 1;
+#else
 static uint32_t is_parrot = 0;
+#endif
 
 static inline uint32_t
 rd(vm_offset_t address)
@@ -248,25 +252,27 @@ rpmh_write(const uint32_t *address, const uint32_t *data, unsigned count)
 	return done;
 }
 
-/* The chip's I/O supply: 1.8 V from LDO2 of the PM8350C ("ldoc2"). Nothing else is connected to it. */
+/* The chip's supply via RPMh: ldoc2 1.8V on redwood, ldoe7 3.3V on parrot (SM6475). */
 static bool
 io_supply_on(void)
 {
-	uint32_t base = rpmh_address("ldoc2");
+	const char *reg_name = is_parrot ? "ldoe7" : "ldoc2";
+	uint32_t mv = is_parrot ? 3300u : 1800u;
+	uint32_t base = rpmh_address(reg_name);
 	uint32_t address[3] = { base + VRM_VOLTAGE, base + VRM_ENABLE, base + VRM_MODE };
-	uint32_t data[3] = { 1800, 1, VRM_MODE_LDO_HPM };
+	uint32_t data[3] = { mv, 1, VRM_MODE_LDO_HPM };
 
 	/* addresses of regulators ("VRM") have 4 in bits 19:16; anything else is not what we are looking for */
 	if (base == 0 || (base >> 16 & 0xf) != 4) {
-		printf("goodix: RPMh: no regulator \"ldoc2\" (address %#x)\n", base);
+		printf("goodix: RPMh: no regulator \"%s\" (address %#x)\n", reg_name, base);
 		return false;
 	}
-	printf("goodix: RPMh: ldoc2 is at %#x; slot status %#x, control %#x, irq enable %#x status %#x\n", base,
+	printf("goodix: RPMh: %s is at %#x; slot status %#x, control %#x, irq enable %#x status %#x\n", reg_name, base,
 	    rd(TCS(TCS_STATUS)), rd(TCS(TCS_CONTROL)), rd(TCS(TCS_IRQ_ENABLE)), rd(TCS(TCS_IRQ_STATUS)));
 	if (!rpmh_write(address, data, 3)) {
 		return false;
 	}
-	printf("goodix: I/O supply on (1.8 V)\n");
+	printf("goodix: supply %s on (%u mV)\n", reg_name, mv);
 	return true;
 }
 
@@ -578,9 +584,47 @@ bitbang_init(void)
 	gpio_configure(bitbang_in, 0, PULL_NONE, 2, false);
 }
 
+static inline void
+bb_spin(uint32_t count)
+{
+	for (volatile uint32_t i = 0; i < count; i++) {
+		__asm__ volatile ("" ::: "memory");
+	}
+}
+
 static bool
 bitbang_transfer(const uint8_t *tx, uint8_t *rx, uint32_t length)
 {
+	if (is_parrot) {
+		if (length == 0) {
+			return true;
+		}
+		wr(GPIO_CFG(PIN_CS), 0x280u);
+		wr(GPIO_CFG(PIN_CLK), 0x280u);
+		wr(GPIO_CFG(PIN_MOSI), 0x280u);
+		wr(GPIO_CFG(PIN_MISO), 0x3u);
+		wr(GPIO_IO(PIN_CS), 0u);
+		bb_spin(40);
+		for (uint32_t i = 0; i < length; i++) {
+			uint8_t out = tx ? tx[i] : 0, in = 0;
+			for (int bit = 7; bit >= 0; bit--) {
+				wr(GPIO_IO(PIN_MOSI), ((out >> bit) & 1u) << 1);
+				bb_spin(25);
+				wr(GPIO_IO(PIN_CLK), 2u);
+				bb_spin(25);
+				in = (uint8_t)((in << 1) | (rd(GPIO_IO(PIN_MISO)) & 1u));
+				wr(GPIO_IO(PIN_CLK), 0u);
+				bb_spin(25);
+			}
+			if (rx) {
+				rx[i] = in;
+			}
+		}
+		bb_spin(40);
+		wr(GPIO_IO(PIN_CS), 2u);
+		bb_spin(100);
+		return true;
+	}
 	gpio_set(PIN_CS, false);
 	sleep_us(1);
 	for (uint32_t i = 0; i < length; i++) {
@@ -927,7 +971,7 @@ goodix_poll(void)
 #define FOCALTECH_CHIP_ID_L         0x9f
 #define FOCALTECH_TOUCH_DATA        0x01		/* the touch report lives at this address */
 #define FOCALTECH_MAX_TOUCHES       10
-#define FOCALTECH_TOUCH_REPORT_LEN  (2 + 6 * FOCALTECH_MAX_TOUCHES)
+#define FOCALTECH_TOUCH_REPORT_LEN  (4 + 8 * FOCALTECH_MAX_TOUCHES)
 #define FOCALTECH_MAX_TRANSFER      (7 + FOCALTECH_TOUCH_REPORT_LEN + 2)
 
 static uint8_t focaltech_tx[FOCALTECH_MAX_TRANSFER], focaltech_rx[FOCALTECH_MAX_TRANSFER];
@@ -1071,11 +1115,12 @@ focaltech_read_boot_id(uint8_t *high, uint8_t *low)
 static bool
 focaltech_wait_valid(uint8_t *high, uint8_t *low)
 {
+	uint8_t want_low = is_parrot ? 0x72 : 0x62;
 	for (int attempt = 0; attempt < 5; attempt++) {
 		if (focaltech_read(FOCALTECH_CHIP_ID_H, high, 1) &&
 		    focaltech_read(FOCALTECH_CHIP_ID_L, low, 1) &&
-		    *high == 0x56 && *low == 0x62) {
-			printf("focaltech: FT3680 runtime ID valid after %d attempt(s)\n", attempt + 1);
+		    *high == 0x56 && (*low == want_low || *low == 0x62 || *low == 0x72)) {
+			printf("focaltech: runtime ID %02x %02x valid after %d attempt(s)\n", *high, *low, attempt + 1);
 			return true;
 		}
 		sleep_ms(200);			/* vendor INTERVAL_READ_REG */
@@ -1158,6 +1203,12 @@ focaltech_probe(bool verbose)
 	/* Maybe firmware is already running (previous session, warm boot). */
 	if (focaltech_wait_valid(&high, &low)) {
 		return true;
+	}
+	if (is_parrot) {
+		if (verbose) {
+			printf("focaltech: FT3683G runtime ID not valid (%02x %02x)\n", high, low);
+		}
+		return false;
 	}
 
 	if (!focaltech_enter_boot_rom()) {
@@ -1275,22 +1326,42 @@ focaltech_report(const uint8_t *report)
 	for (uint32_t i = 0; i < FOCALTECH_MAX_TOUCHES; i++) {
 		focaltech_contact[i].seen = false;
 	}
-	for (uint32_t i = 0; i < FOCALTECH_MAX_TOUCHES; i++) {
-		const uint8_t *touch = report + 2 + 6 * i;
-		uint32_t id = (touch[2] >> 4) & 0x0f;
-		uint32_t event, x, y;
-
-		if (id >= FOCALTECH_MAX_TOUCHES) {
-			break;			/* no more valid slots in this report */
+	if (is_parrot) {
+		if (count > FOCALTECH_MAX_TOUCHES) {
+			count = FOCALTECH_MAX_TOUCHES;
 		}
-		event = (touch[0] >> 6) & 0x3;
-		x = ((uint32_t)(touch[0] & 0x0f) << 11) | ((uint32_t)touch[1] << 3) |
-		    ((uint32_t)touch[4] >> 5);
-		y = ((uint32_t)(touch[2] & 0x0f) << 11) | ((uint32_t)touch[3] << 3) |
-		    (((uint32_t)touch[4] & 0x1c) >> 2);
-		focaltech_contact_update(id, event, x, y, focaltech_max_x, focaltech_max_y);
+		for (uint32_t i = 0; i < count; i++) {
+			const uint8_t *touch = report + 4 + 8 * i;
+			uint32_t id = (touch[2] >> 4) & 0x0f;
+			uint32_t event, x, y;
+
+			if (id >= FOCALTECH_MAX_TOUCHES) {
+				break;
+			}
+			event = (touch[0] >> 6) & 0x3;
+			x = ((uint32_t)(touch[0] & 0x0f) << 12) | ((uint32_t)touch[1] << 4) |
+			    ((uint32_t)touch[4] >> 4);
+			y = ((uint32_t)(touch[2] & 0x0f) << 12) | ((uint32_t)touch[3] << 4) |
+			    ((uint32_t)touch[4] & 0x0f);
+			focaltech_contact_update(id, event, x, y, 17280u, 38400u);
+		}
+	} else {
+		for (uint32_t i = 0; i < FOCALTECH_MAX_TOUCHES; i++) {
+			const uint8_t *touch = report + 2 + 6 * i;
+			uint32_t id = (touch[2] >> 4) & 0x0f;
+			uint32_t event, x, y;
+
+			if (id >= FOCALTECH_MAX_TOUCHES) {
+				break;			/* no more valid slots in this report */
+			}
+			event = (touch[0] >> 6) & 0x3;
+			x = ((uint32_t)(touch[0] & 0x0f) << 11) | ((uint32_t)touch[1] << 3) |
+			    ((uint32_t)touch[4] >> 5);
+			y = ((uint32_t)(touch[2] & 0x0f) << 11) | ((uint32_t)touch[3] << 3) |
+			    (((uint32_t)touch[4] & 0x1c) >> 2);
+			focaltech_contact_update(id, event, x, y, focaltech_max_x, focaltech_max_y);
+		}
 	}
-	(void)count;
 	/* Fingers not in this report are up (vendor driver uses a bitmap; we remember explicitly). */
 	for (uint32_t i = 0; i < FOCALTECH_MAX_TOUCHES; i++) {
 		if (!focaltech_contact[i].seen && focaltech_contact[i].down) {
@@ -1305,9 +1376,10 @@ focaltech_poll(void)
 {
 	static uint8_t report[FOCALTECH_TOUCH_REPORT_LEN];
 	static unsigned bad;
+	uint32_t rlen = is_parrot ? FOCALTECH_TOUCH_REPORT_LEN : (2 + 6 * FOCALTECH_MAX_TOUCHES);
 
 	seen.polls++;
-	if (!focaltech_read(FOCALTECH_TOUCH_DATA, report, sizeof(report))) {
+	if (!focaltech_read(FOCALTECH_TOUCH_DATA, report, rlen)) {
 		seen.bad++;
 		if (bad++ < 8) {
 			printf("focaltech: SPI read failed for touch report\n");
@@ -1386,13 +1458,24 @@ show_state(const char *when)
 static bool
 power_on(void)
 {
-	gpio_output(PIN_RESET, false, PULL_UP, 8);
-	gpio_configure(PIN_INT, 0, PULL_UP, 8, false);
-	if (!is_parrot) {
-		/* without its I/O rail the chip must not get the analog supply or be driven: stop before AVDD */
+	if (is_parrot) {
 		if (!io_supply_on()) {
 			return false;
 		}
+		gpio_output(PIN_AVDD, true, PULL_NONE, 8);
+		sleep_ms(15);
+		gpio_output(PIN_RESET, false, PULL_UP, 8);
+		sleep_ms(10);
+		gpio_set(PIN_RESET, true);
+		sleep_ms(200);
+		gpio_configure(PIN_INT, 0, PULL_UP, 2, false);
+		return true;
+	}
+	gpio_output(PIN_RESET, false, PULL_UP, 8);
+	gpio_configure(PIN_INT, 0, PULL_UP, 8, false);
+	/* without its I/O rail the chip must not get the analog supply or be driven: stop before AVDD */
+	if (!io_supply_on()) {
+		return false;
 	}
 	sleep_ms(3);
 	gpio_output(PIN_AVDD, true, PULL_NONE, 2);
@@ -1420,6 +1503,33 @@ bring_up(void)
 {
 	const char *problem = "its clocks cannot be turned on";
 
+	if (is_parrot) {
+		touch_chip = TOUCH_FOCALTECH;
+		if (!power_on()) {
+			printf("goodix: parrot ldoe7 supply failed\n");
+			return false;
+		}
+		spi_transfer = bitbang_transfer;
+		bitbang_in = PIN_MISO;
+		bitbang_out = PIN_MOSI;
+		wr(GPIO_IO(PIN_CS), 2u);
+		wr(GPIO_CFG(PIN_CS), 0x280u);
+		wr(GPIO_IO(PIN_CLK), 0u);
+		wr(GPIO_CFG(PIN_CLK), 0x280u);
+		wr(GPIO_IO(PIN_MOSI), 0u);
+		wr(GPIO_CFG(PIN_MOSI), 0x280u);
+		wr(GPIO_CFG(PIN_MISO), 0x3u);
+		for (int attempt = 0; attempt < 5; attempt++) {
+			if (focaltech_probe(true)) {
+				printf("goodix: parrot FT3683G ready on bitbang SPI\n");
+				return true;
+			}
+			sleep_ms(100);
+		}
+		printf("goodix: parrot FT3683G probe failed\n");
+		return false;
+	}
+
 	show_state("as found");
 	touch_chip = touch_chip_detect();
 	printf("goodix: ID gpio96=%u gpio68=%u: selected %s\n", gpio_get(PIN_GOODIX_ID),
@@ -1429,7 +1539,7 @@ bring_up(void)
 		return false;
 	}
 
-	if (!is_parrot && clocks_on()) {
+	if (clocks_on()) {
 		printf("goodix: serial engine: firmware %#x, interface %#x, parameters %#x, source clock %u Hz (select %u)\n",
 		    rd(GENI_FW_REVISION_RO), rd(GENI_IF_DISABLE_RO), rd(SE_HW_PARAM_0), se_source_hz, se_clock_select);
 		uint32_t spi_hz = 1000000;
@@ -1442,7 +1552,7 @@ bring_up(void)
 		printf("goodix: the bus at %u Hz\n", spi_hz);
 		problem = geni_spi_init(spi_hz);
 	}
-	if (!is_parrot && problem == NULL) {
+	if (problem == NULL) {
 		use_engine_pins();
 		spi_transfer = geni_transfer;
 		show_state("powered, on the serial engine");
@@ -1450,7 +1560,7 @@ bring_up(void)
 			return true;
 		}
 		printf("goodix: %s did not answer through the serial engine; trying the pins by hand\n", chip_name());
-	} else if (!is_parrot) {
+	} else {
 		printf("goodix: %s; driving the pins by hand\n", problem);
 	}
 
@@ -1499,22 +1609,22 @@ static void
 goodix_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	unsigned idle = 0, idle_looks;
-	uint32_t poll_us = 8000, latency = 0, reads = 0;
+	uint32_t poll_us = is_parrot ? 4000 : 8000, latency = 0, reads = 0;
 	uint64_t before = 0, reading = 0;
 
 	PE_parse_boot_argn("touch_poll_us", &poll_us, sizeof(poll_us));
 	PE_parse_boot_argn("touch_lat", &latency, sizeof(latency));
 	if (poll_us < 250 || poll_us > 100000) {
-		poll_us = 8000;
+		poll_us = is_parrot ? 4000 : 8000;
 	}
 	idle_looks = 16000 / poll_us;   /* a report read every 16 ms even with the line high, in case it is missed */
 
-	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
+	tlmm = ml_io_map(is_parrot ? 0x0f100000UL : TLMM_PHYS, TLMM_SIZE);
+	rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
+	cmd_db = ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);      /* memory, not registers: no alignment rules */
 	if (!is_parrot) {
 		gcc = ml_io_map(GCC_PHYS, GCC_SIZE);
 		se = ml_io_map(SE_PHYS, SE_SIZE);
-		rsc = ml_io_map(RSC_PHYS, RSC_SIZE);
-		cmd_db = ml_io_map_wcomb(CMD_DB_PHYS, CMD_DB_SIZE);      /* memory, not registers: no alignment rules */
 	}
 
 	if (!bring_up()) {

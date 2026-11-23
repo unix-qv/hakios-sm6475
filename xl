@@ -56,7 +56,7 @@ cd "$(dirname "$(readlink -f "$0")")" || exit 1
 # On a Mac: flock, GNU timeout and stat, and Android's platform-tools, from tools/macos-bin (see its README)
 [ "$(uname)" = Darwin ] && PATH=$PWD/tools/macos-bin:$PWD/tools/macos-bin/platform-tools:$PATH
 # the kernel and the loader built here, or else the ones that come with the repository
-K=hakios-kernel                 # make kernel makes it
+K=${XL_KERNEL:-hakios-kernel}   # make kernel makes it
 [ -f $K ] || K=prebuilt/hakios-kernel
 L=xnuloader/loader.efi
 if [ ! -f $L ]; then
@@ -236,6 +236,7 @@ run() { # run <oem command> <label>
 	fi
 	local live=; live_loader && live=1
 	fb $1 >/dev/null
+	sleep 1
 	if [ -n "$live" ] && [ "$1" != "oem selftest" ]; then
 		# the loader goes on answering: ask every two seconds until the result is no longer "running".
 		# XL_FOLLOW=N: fetch the log as it stands every N seconds as well, so that a phone that

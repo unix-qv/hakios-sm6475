@@ -54,9 +54,13 @@ tell(const char *format, ...)
 	}
 }
 
-#define EPSS_PHYS               0x18591000UL    /* three groups ("domains") of 0x1000: small cores, big, biggest */
+static vm_offset_t epss_phys = 0x18591000UL;
+static uint32_t epss_domains = 3;
+static vm_offset_t rsc_phys = 0x18220000UL;
+
+#define EPSS_PHYS               epss_phys       /* groups ("domains") of 0x1000: small cores, big[, biggest] */
 #define EPSS_DOMAIN_SIZE        0x1000UL
-#define EPSS_DOMAINS            3
+#define EPSS_DOMAINS            3               /* max array size */
 #define EPSS_FREQ_TABLE         0x100           /* a word per row: [31:30] clock source, [7:0] multiple of 19.2 MHz */
 #define EPSS_TABLE_ROWS         40
 #define EPSS_PERF_STATE         0x320           /* the row that is wanted */
@@ -83,6 +87,9 @@ domain_of(uint32_t phys_id)
 {
 	uint32_t core = (phys_id >> 8) & 0xff;
 
+	if (epss_domains == 2) {
+		return core < 4 ? 0 : 1;
+	}
 	return core < 4 ? 0 : core < 7 ? 1 : 2;
 }
 
@@ -380,7 +387,7 @@ ddr_look(void)
  * each (sc7280's qcom,tcs-config): every command with an address, and which of them go to the BCMs
  * above -- the bandwidth it asked for, and that is in force whenever the processors are awake.
  */
-#define RSC_PHYS                0x18220000UL
+#define RSC_PHYS                rsc_phys
 #define RSC_SIZE                0x10000UL
 #define RSC_TCS(n, reg)         (0xd00 + 0x2a0 * (n) + (reg))
 #define RSC_TCS_COUNT           9
@@ -560,7 +567,15 @@ void
 hakios_cpufreq_init(void)
 {
 	const ml_topology_info_t *topology = ml_get_topology_info();
-	uint32_t enabled = 0, membench = 0, cores[EPSS_DOMAINS] = { 0 }, before, here;
+	uint32_t enabled = 0, membench = 0, cores[EPSS_DOMAINS] = { 0 }, before, here, val = 0;
+
+	if (PE_parse_boot_argn("soc_rsc", &val, sizeof(val)) && val != 0) {
+		rsc_phys = val;
+		if (val == 0x17a20000u) {
+			epss_phys = 0x17d91000UL;
+			epss_domains = 2;
+		}
+	}
 
 	load_start();
 	enabled = 2;
@@ -581,7 +596,7 @@ hakios_cpufreq_init(void)
 	/* (whichever core this thread happens to be on, and stays on or not: it only goes to the log) */
 	here = (uint32_t)(__builtin_arm_rsr64("MPIDR_EL1") >> 8) & 0xff;
 	before = loop_speed();
-	for (uint32_t domain = 0; domain < EPSS_DOMAINS; domain++) {
+	for (uint32_t domain = 0; domain < epss_domains; domain++) {
 		if (cores[domain] != 0) {
 			raise_domain(domain, cores[domain]);
 		}

@@ -222,7 +222,19 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
         # these start, crash and are asked for again, over and over. (aggregated, which was among them, is where
         # Darwin userland 16 keeps its power log -- com.apple.powerlog.plxpclogger.xpc and the rest -- that Settings > Battery
         # waits for; it now runs through a session.)
-        'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced')
+        'homed', 'routined', 'duetexpertd', 'com.apple.dmd', 'syncdefaultsd', 'photoanalysisd', 'avconferenced',
+        # heavy poster/widget/cloud/siri/health daemons that exhaust the 3 GB RAM window under Jetsam
+        'PosterBoard', 'chronod', 'cloudd', 'mediaanalysisd', 'corespeechd', 'siri', 'Siri', 'healthd',
+        'suggestd', 'intelligenceplatformd', 'proactive', 'parsec', 'spotlight', 'familycircled',
+        'financed', 'passd', 'Passbook', 'tipsd', 'triald', 'remindd', 'contactsd',
+        'accountsd', 'itunesstored', 'storekitd', 'appstored', 'gamed', 'calaccessd', 'imagent',
+        'IMDPersistence', 'callservicesd', 'assetsd', 'newsd', 'weather', 'Weather',
+        'fmfd', 'searchd', 'knowledge', 'mlruntimed', 'speechmodeltrainingd', 'contextstored',
+        'ScreenTime', 'UsageTracking', 'dprivacyd', 'followupd', 'peopled', 'sharingd',
+        'nanoprefsyncd', 'nanotimekit', 'watchlistd', 'sportsd', 'momentsd',
+        'dasd', 'awdd', 'ABDatabaseDoctor', 'WirelessRadioManager', 'online-auth-agent',
+        'Safari.History', 'SafariBookmarksSyncAgent', 'Safari.SafeBrowsing', 'Safari.passwordbreachd',
+        'cloudkeychainproxy', 'sociallayerd', 'networkserviceproxy')
 
 # ALLOW="word ..." in the environment lets jobs through that DENY would stop: for trying one out
 DENY = tuple(word for word in DENY if word not in os.environ.get('ALLOW', '').split())
@@ -268,6 +280,8 @@ for label in labels:
     with open(f'{src}/{label}.plist', 'rb') as f:
         job = plistlib.load(f)
     job['StandardErrorPath'] = '/dev/console'
+    job['EnablePressuredExit'] = False
+    job.pop('EnableTransactions', None)
     # a job that is named is wanted, whatever hardware it says it is for: wifid's asks for a node "wlan" in the
     # device tree, which the loader's tree does not have yet
     job.pop('_LimitLoadToDeviceTree', None)
@@ -297,6 +311,9 @@ if rest:
         for key in ('RunAtLoad', 'KeepAlive', 'StartInterval', 'StartCalendarInterval', 'WatchPaths',
                     'QueueDirectories', 'StartOnMount', 'LaunchEvents'):
             job.pop(key, None)
+        if label in ('com.apple.mediaserverd', 'com.apple.voicememod', 'com.apple.tccd'):
+            job['EnablePressuredExit'] = False
+            job.pop('EnableTransactions', None)
         job['StandardErrorPath'] = '/dev/console'
         if label in oslog:
             job.setdefault('EnvironmentVariables', {})['OS_ACTIVITY_DT_MODE'] = 'YES'
